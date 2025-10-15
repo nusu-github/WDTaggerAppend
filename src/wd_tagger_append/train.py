@@ -210,9 +210,6 @@ def train(
     )
     typer.echo(f"Total labels after extension: {extended_labels.num_labels}")
 
-    # Create label mappings
-    label2id, id2label = extended_labels.to_label_mappings()
-
     typer.echo("Vectorizing labels once via dataset caching...")
     label_encoding_fn = create_label_encoding_function(extended_labels)
     updated_features = dataset.features.copy()
@@ -262,13 +259,13 @@ def train(
 
     # Reload model with new number of classes
     typer.echo(f"Creating model with {num_original_labels + num_new_classes} classes...")
+    label2id, id2label = extended_labels.to_label_mappings()
     model = AutoModelForImageClassification.from_pretrained(
         model_repo_id,
         num_labels=num_original_labels + num_new_classes,
-        label2id=label2id,
-        id2label=id2label,
         ignore_mismatched_sizes=True,
     )
+    configure_model_for_remote(model)
 
     # Manually set existing and new weights
     model.timm_model.head.weight.data = torch.cat([original_weight, new_weight_rows], dim=0)
@@ -438,12 +435,20 @@ def train(
         typer.echo(f"Loading best adapter from {best_checkpoint_path}")
 
         # Reload base model for merging
+        label2id, id2label = extended_labels.to_label_mappings()
         base_model = AutoModelForImageClassification.from_pretrained(
             model_repo_id,
             num_labels=extended_labels.num_labels,
-            id2label=id2label,
             label2id=label2id,
+            id2label=id2label,
+            ignore_mismatched_sizes=True,
         )
+
+        base_model.timm_model.head.weight.data = torch.cat(
+            [original_weight, new_weight_rows],
+            dim=0,
+        )
+        model.timm_model.head.bias.data = torch.cat([original_bias, new_bias_values], dim=0)
 
         # Load PEFT model and merge
         merged_model = PeftModel.from_pretrained(base_model, best_checkpoint_path)
