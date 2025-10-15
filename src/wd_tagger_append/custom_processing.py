@@ -74,25 +74,6 @@ class PadToSquare(v2.Transform):
         return tensor
 
 
-class RandomHorizontalFlipTransform(v2.Transform):
-    """Randomly flip images horizontally."""
-
-    def __init__(self, probability: float) -> None:
-        super().__init__()
-        self.probability = float(probability)
-
-    def make_params(self, flat_inputs: list[Any]) -> dict[str, Any]:
-        do_flip = self.probability > 0.0 and random.random() < self.probability
-        return {"flip": do_flip}
-
-    def transform(self, inpt: Any, params: dict[str, Any]) -> torch.Tensor:
-        tensor = inpt if isinstance(inpt, torch.Tensor) else F.to_image(inpt)
-        tensor = F.to_dtype(tensor, torch.float32, not tensor.dtype.is_floating_point)
-        if not params.get("flip", False):
-            return tensor
-        return F.horizontal_flip(tensor)
-
-
 class RandomSquareCropTransform(v2.Transform):
     """Crop a random square area from the image."""
 
@@ -135,41 +116,6 @@ class RandomSquareCropTransform(v2.Transform):
         if not params.get("crop", False):
             return tensor
         return F.crop(tensor, params["top"], params["left"], params["size"], params["size"])
-
-
-class RandomRotationTransform(v2.Transform):
-    """Rotate images within the configured bounds."""
-
-    def __init__(self, max_degrees: float) -> None:
-        super().__init__()
-        self.max_degrees = float(max_degrees)
-
-    def make_params(self, flat_inputs: list[Any]) -> dict[str, Any]:
-        if self.max_degrees <= 0.0:
-            return {"angle": 0.0}
-        angle = random.uniform(-self.max_degrees, self.max_degrees)
-        return {"angle": angle}
-
-    def transform(self, inpt: Any, params: dict[str, Any]) -> torch.Tensor:
-        tensor = inpt if isinstance(inpt, torch.Tensor) else F.to_image(inpt)
-        tensor = F.to_dtype(
-            tensor,
-            torch.float32,
-            not tensor.dtype.is_floating_point,
-        ).contiguous()
-        angle = params.get("angle", 0.0)
-        if math.isclose(angle, 0.0, abs_tol=1e-3):
-            return tensor
-
-        channels = int(tensor.shape[0]) if tensor.ndim >= 3 else 1
-        fill_values = [1.0] * max(channels, 1)
-        return F.rotate(
-            tensor,
-            angle,
-            interpolation=InterpolationMode.BILINEAR,
-            expand=True,
-            fill=fill_values,
-        )
 
 
 class ResizeWithInterpolationTransform(v2.Transform):
@@ -221,68 +167,6 @@ class ResizeWithInterpolationTransform(v2.Transform):
             antialias=True,
         )
         return F.to_dtype(resized_tensor, torch.float32, False)
-
-
-class RandomCutoutTransform(v2.Transform):
-    """Apply cutout augmentation to a random square region."""
-
-    def __init__(
-        self,
-        probability: float,
-        min_ratio: float,
-        max_ratio: float,
-        fill: int = 127,
-    ) -> None:
-        super().__init__()
-        self.probability = float(probability)
-        self.min_ratio = float(min_ratio)
-        self.max_ratio = float(max_ratio)
-        self.fill = float(fill)
-
-    def make_params(self, flat_inputs: list[Any]) -> dict[str, Any]:
-        if not flat_inputs or self.probability <= 0.0:
-            return {"apply": False}
-
-        should_apply = random.random() < self.probability
-        if not should_apply:
-            return {"apply": False}
-
-        tensor = F.to_image(flat_inputs[0])
-        _, height, width = tensor.shape
-        if min(height, width) <= 1:
-            return {"apply": False}
-
-        min_ratio = max(self.min_ratio, 0.0)
-        max_ratio = min(self.max_ratio, 1.0)
-        if max_ratio <= 0 or max_ratio <= min_ratio:
-            return {"apply": False}
-
-        cutout_ratio = random.uniform(min_ratio, max_ratio)
-        cutout_size = max(1, round(min(height, width) * cutout_ratio))
-
-        center_x = random.randint(0, width - 1)
-        center_y = random.randint(0, height - 1)
-
-        half = cutout_size // 2
-        x1 = max(center_x - half, 0)
-        y1 = max(center_y - half, 0)
-        x2 = min(x1 + cutout_size, width)
-        y2 = min(y1 + cutout_size, height)
-
-        return {"apply": True, "x1": x1, "y1": y1, "x2": x2, "y2": y2}
-
-    def transform(self, inpt: Any, params: dict[str, Any]) -> torch.Tensor:
-        tensor = inpt if isinstance(inpt, torch.Tensor) else F.to_image(inpt)
-        tensor = F.to_dtype(tensor, torch.float32, not tensor.dtype.is_floating_point)
-        if not params.get("apply", False):
-            return tensor
-
-        cutout = tensor.clone()
-        fill_value = float(self.fill)
-        if fill_value > 1.0:
-            fill_value /= 255.0
-        cutout[:, params["y1"] : params["y2"], params["x1"] : params["x2"]] = fill_value
-        return cutout
 
 
 class ToBGRTensor(v2.Transform):
@@ -403,7 +287,7 @@ def build_train_transform(
 
     transforms: list[v2.Transform] = [EnsureRGB(), PadToSquare()]
     if config.apply_flip:
-        transforms.append(RandomHorizontalFlipTransform(config.flip_prob))
+        transforms.append(v2.RandomHorizontalFlip(p=config.flip_prob))
     if config.apply_random_crop:
         transforms.append(
             RandomSquareCropTransform(
@@ -412,7 +296,14 @@ def build_train_transform(
             ),
         )
     if config.apply_rotation:
-        transforms.append(RandomRotationTransform(config.max_rotation_degrees))
+        transforms.append(
+            v2.RandomRotation(
+                degrees=(-config.max_rotation_degrees, config.max_rotation_degrees),
+                interpolation=InterpolationMode.BILINEAR,
+                expand=True,
+                fill=1.0,
+            ),
+        )
     transforms.append(
         ResizeWithInterpolationTransform(
             config.size,
@@ -422,11 +313,16 @@ def build_train_transform(
         ),
     )
     if config.apply_cutout:
+        # Convert cutout_min_ratio and cutout_max_ratio to scale parameter for RandomErasing
+        # RandomErasing uses area proportion, so we need to square the ratio
+        min_scale = config.cutout_min_ratio**2
+        max_scale = config.cutout_max_ratio**2
         transforms.append(
-            RandomCutoutTransform(
-                config.cutout_prob,
-                config.cutout_min_ratio,
-                config.cutout_max_ratio,
+            v2.RandomErasing(
+                p=config.cutout_prob,
+                scale=(min_scale, max_scale),
+                ratio=(1.0, 1.0),  # Square region
+                value=127 / 255.0,  # Normalized gray value
             ),
         )
     transforms.append(ToBGRTensor(mean, std))
