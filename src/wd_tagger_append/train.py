@@ -475,6 +475,7 @@ def train(
         api.upload_folder(
             folder_path=str(output_dir_path),
             repo_id=hub_repo_id,
+            token=token,
             repo_type="model",
         )
         typer.echo(f"Successfully uploaded merged model to https://huggingface.co/{hub_repo_id}")
