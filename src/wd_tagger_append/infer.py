@@ -9,7 +9,7 @@ from PIL import Image
 from torch import Tensor
 from transformers import (
     AutoImageProcessor,
-    AutoModel,
+    AutoModelForImageClassification,
     TimmWrapperForImageClassification,
     TimmWrapperImageProcessor,
 )
@@ -101,6 +101,13 @@ def infer(
         typer.Option(help="Threshold for character tags", min=0.0, max=1.0),
     ] = 0.75,
     token: Annotated[str | None, typer.Option(help="Hugging Face API token")] = None,
+    discard_existing_tags: Annotated[
+        bool,
+        typer.Option(
+            "--discard-existing-tags/--keep-existing-tags",
+            help="Discard any stored tags instead of merging with current predictions",
+        ),
+    ] = False,
 ) -> None:
     """Execute tag inference on an image."""
     # Validate image path
@@ -118,7 +125,7 @@ def infer(
         token=token,
         trust_remote_code=True,
     )
-    model = AutoModel.from_pretrained(
+    model = AutoModelForImageClassification.from_pretrained(
         model_id_or_path,
         token=token,
         trust_remote_code=True,
@@ -151,6 +158,10 @@ def infer(
             model = cast("Any", model).to(device="cpu")
 
     typer.echo("Processing results...")
+    if discard_existing_tags:
+        typer.echo("Discarding stored tags (merge behaviour will be wired in a future update).")
+    else:
+        typer.echo("Keeping stored tags when merge support lands.")
     caption, taglist, ratings, character, general = get_tags(
         probs=outputs.squeeze(0),
         labels=labels,

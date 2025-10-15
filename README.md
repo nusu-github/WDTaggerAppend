@@ -82,6 +82,8 @@ python -m wd_tagger_append.train username/dataset-name \
 - `--test-size`: Validation split ratio (default: `0.1`)
 - `--seed`: Random seed for reproducibility (default: `42`)
 - `--fp16/--no-fp16`: Enable mixed precision training (default: `True` if CUDA available)
+- `--consistency-weight`: Strength of the teacher KL penalty (default: `0.2`; set to `0` to disable)
+- `--consistency-warmup-ratio`: Fraction of total steps spent ramping in the penalty (default: `0.0`)
 
 ### 3. Inference
 
@@ -107,6 +109,7 @@ python -m wd_tagger_append.infer path/to/image.jpg \
 - `--gen-threshold`: Confidence threshold for general tags (default: `0.35`, range: `0.0-1.0`)
 - `--char-threshold`: Confidence threshold for character tags (default: `0.75`, range: `0.0-1.0`)
 - `--token`: Hugging Face API token for private models
+- `--discard-existing-tags/--keep-existing-tags`: Control whether previously stored tags are merged (default: keep)
 
 ### 4. Merge and Upload Model
 

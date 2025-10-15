@@ -455,11 +455,11 @@ class WDTaggerImageProcessor(TimmWrapperImageProcessor):
         self.image_height, self.image_width = self._resolve_target_size()
         self._mean = torch.tensor(
             self.data_config.get("mean", (0.5, 0.5, 0.5)),
-            torch.float32,
+            dtype=torch.float32,
         ).view(3, 1, 1)
         self._std = torch.tensor(
             self.data_config.get("std", (0.5, 0.5, 0.5)),
-            torch.float32,
+            dtype=torch.float32,
         ).view(3, 1, 1)
         self._eval_interpolation = self._resolve_interpolation(
             self.data_config.get("interpolation", "bicubic"),
@@ -579,6 +579,24 @@ class WDTaggerImageProcessor(TimmWrapperImageProcessor):
 
     def to_dict(self) -> dict[str, Any]:
         data = super().to_dict()
+
+        # Add serializable augmentation configs
         data["train_augmentation_config"] = asdict(self.train_augmentation_config)
         data["evaluation_augmentation_config"] = asdict(self.eval_augmentation_config)
+
+        # Remove non-serializable attributes
+        non_serializable_keys = [
+            "_mean",
+            "_std",
+            "_bgr_mean",
+            "_bgr_std",
+            "_eval_interpolation",
+            "train_transforms",
+            "val_transforms",
+            "train_augmentation_config",  # Remove the object version
+            "eval_augmentation_config",  # Remove the object version
+        ]
+        for key in non_serializable_keys:
+            data.pop(key, None)
+
         return data

@@ -11,7 +11,6 @@ from transformers import (
     AutoImageProcessor,
     AutoModelForImageClassification,
     TimmWrapperImageProcessor,
-    Trainer,
     TrainingArguments,
 )
 
@@ -36,6 +35,11 @@ from wd_tagger_append.labels import (
 from wd_tagger_append.model_export import (
     configure_model_for_remote,
     copy_custom_processor_code,
+)
+from wd_tagger_append.training import (
+    ConsistencyConfig,
+    ConsistencyTrainer,
+    build_teacher_model,
 )
 
 app = typer.Typer(help="WD Tagger model training tool")
@@ -170,6 +174,21 @@ def train(
         float,
         typer.Option(help="Probability of applying MixUp to a batch", min=0.0, max=1.0),
     ] = 1.0,
+    consistency_weight: Annotated[
+        float,
+        typer.Option(
+            help="Weight applied to the teacher consistency KL penalty (0 disables the feature)",
+            min=0.0,
+        ),
+    ] = 0.2,
+    consistency_warmup_ratio: Annotated[
+        float,
+        typer.Option(
+            help="Fraction of total steps reserved to warm up the consistency penalty",
+            min=0.0,
+            max=1.0,
+        ),
+    ] = 0.0,
 ) -> None:
     """Execute model training."""
     # Get model repository ID
@@ -263,13 +282,17 @@ def train(
     model = AutoModelForImageClassification.from_pretrained(
         model_repo_id,
         num_labels=num_original_labels + num_new_classes,
+        label2id=label2id,
+        id2label=id2label,
         ignore_mismatched_sizes=True,
     )
     configure_model_for_remote(model)
 
     # Manually set existing and new weights
-    model.timm_model.head.weight.data = torch.cat([original_weight, new_weight_rows], dim=0)
-    model.timm_model.head.bias.data = torch.cat([original_bias, new_bias_values], dim=0)
+    expanded_weight = torch.cat([original_weight, new_weight_rows], dim=0)
+    expanded_bias = torch.cat([original_bias, new_bias_values], dim=0)
+    model.timm_model.head.weight.data = expanded_weight.clone()
+    model.timm_model.head.bias.data = expanded_bias.clone()
 
     # Configure LoRA
     typer.echo("Setting up LoRA...")
@@ -295,6 +318,20 @@ def train(
     # Wrap with PEFT model
     peft_model = get_peft_model(model, lora_config)
     peft_model.print_trainable_parameters()
+
+    teacher_model = None
+    if consistency_weight > 0.0:
+        typer.echo("Building frozen teacher model for consistency regularisation...")
+        teacher_model = build_teacher_model(
+            model_repo_id=model_repo_id,
+            extended_labels=extended_labels,
+            original_weight=original_weight.detach().clone(),
+            original_bias=original_bias.detach().clone(),
+            new_weight_rows=new_weight_rows.detach().clone(),
+            new_bias_values=new_bias_values.detach().clone(),
+        )
+    else:
+        typer.echo("Consistency loss disabled (teacher model not created).")
 
     # Set output directory
     if huggingface_account:
@@ -405,9 +442,15 @@ def train(
 
     # Create trainer and train
     typer.echo("Creating trainer...")
-    trainer = Trainer(
-        peft_model,
-        training_args,
+    consistency_config = ConsistencyConfig(
+        weight=consistency_weight,
+        warmup_ratio=consistency_warmup_ratio,
+        teacher=teacher_model,
+    )
+    trainer = ConsistencyTrainer(
+        consistency=consistency_config,
+        model=peft_model,
+        args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         processing_class=image_processor,
