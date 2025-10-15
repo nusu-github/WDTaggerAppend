@@ -32,8 +32,8 @@ class EnsureRGB(v2.Transform):
             tensor_image = F.to_image(image)
 
         if tensor_image.shape[0] == 4:
-            alpha = F.to_dtype(tensor_image[3:4], dtype=torch.float32, scale=True)
-            rgb = F.to_dtype(tensor_image[:3], dtype=torch.float32, scale=True)
+            alpha = F.to_dtype(tensor_image[3:4], torch.float32, True)
+            rgb = F.to_dtype(tensor_image[:3], torch.float32, True)
             alpha = alpha.expand_as(rgb)
             composite = rgb * alpha + (1.0 - alpha)
             tensor_image = composite
@@ -45,8 +45,8 @@ class EnsureRGB(v2.Transform):
         tensor_image = tensor_image[:3]
         return F.to_dtype(
             tensor_image,
-            dtype=torch.float32,
-            scale=not tensor_image.dtype.is_floating_point,
+            torch.float32,
+            not tensor_image.dtype.is_floating_point,
         )
 
 
@@ -59,7 +59,7 @@ class PadToSquare(v2.Transform):
 
     def transform(self, inpt: Any, params: dict[str, Any]) -> torch.Tensor:
         tensor = inpt if isinstance(inpt, torch.Tensor) else F.to_image(inpt)
-        tensor = F.to_dtype(tensor, dtype=torch.float32, scale=not tensor.dtype.is_floating_point)
+        tensor = F.to_dtype(tensor, torch.float32, not tensor.dtype.is_floating_point)
         _, height, width = tensor.shape
         max_dim = int(max(height, width))
         pad_left = (max_dim - width) // 2
@@ -87,7 +87,7 @@ class RandomHorizontalFlipTransform(v2.Transform):
 
     def transform(self, inpt: Any, params: dict[str, Any]) -> torch.Tensor:
         tensor = inpt if isinstance(inpt, torch.Tensor) else F.to_image(inpt)
-        tensor = F.to_dtype(tensor, dtype=torch.float32, scale=not tensor.dtype.is_floating_point)
+        tensor = F.to_dtype(tensor, torch.float32, not tensor.dtype.is_floating_point)
         if not params.get("flip", False):
             return tensor
         return F.horizontal_flip(tensor)
@@ -131,7 +131,7 @@ class RandomSquareCropTransform(v2.Transform):
 
     def transform(self, inpt: Any, params: dict[str, Any]) -> torch.Tensor:
         tensor = inpt if isinstance(inpt, torch.Tensor) else F.to_image(inpt)
-        tensor = F.to_dtype(tensor, dtype=torch.float32, scale=not tensor.dtype.is_floating_point)
+        tensor = F.to_dtype(tensor, torch.float32, not tensor.dtype.is_floating_point)
         if not params.get("crop", False):
             return tensor
         return F.crop(tensor, params["top"], params["left"], params["size"], params["size"])
@@ -154,8 +154,8 @@ class RandomRotationTransform(v2.Transform):
         tensor = inpt if isinstance(inpt, torch.Tensor) else F.to_image(inpt)
         tensor = F.to_dtype(
             tensor,
-            dtype=torch.float32,
-            scale=not tensor.dtype.is_floating_point,
+            torch.float32,
+            not tensor.dtype.is_floating_point,
         ).contiguous()
         angle = params.get("angle", 0.0)
         if math.isclose(angle, 0.0, abs_tol=1e-3):
@@ -198,21 +198,21 @@ class ResizeWithInterpolationTransform(v2.Transform):
 
     def transform(self, inpt: Any, params: dict[str, Any]) -> torch.Tensor:
         tensor = inpt if isinstance(inpt, torch.Tensor) else F.to_image(inpt)
-        tensor = F.to_dtype(tensor, dtype=torch.float32, scale=not tensor.dtype.is_floating_point)
+        tensor = F.to_dtype(tensor, torch.float32, not tensor.dtype.is_floating_point)
         interpolation = params.get("interpolation", self.default_interpolation)
         target_height, target_width = self.size
 
         if interpolation == InterpolationMode.LANCZOS:
             # Lanczos resizing does not support pytorch tensors directly
             pil_img = F.to_pil_image(
-                F.to_dtype(tensor, dtype=torch.uint8, scale=True).contiguous(),
+                F.to_dtype(tensor, torch.uint8, True).contiguous(),
             )
             pil_img = pil_img.resize(
                 (target_width, target_height),
                 resample=Image.Resampling.LANCZOS,
             )
             resized = F.to_image(pil_img)
-            return F.to_dtype(resized, dtype=torch.float32, scale=True)
+            return F.to_dtype(resized, torch.float32, True)
 
         resized_tensor = F.resize(
             tensor,
@@ -220,7 +220,7 @@ class ResizeWithInterpolationTransform(v2.Transform):
             interpolation=interpolation,
             antialias=True,
         )
-        return F.to_dtype(resized_tensor, dtype=torch.float32, scale=False)
+        return F.to_dtype(resized_tensor, torch.float32, False)
 
 
 class RandomCutoutTransform(v2.Transform):
@@ -273,7 +273,7 @@ class RandomCutoutTransform(v2.Transform):
 
     def transform(self, inpt: Any, params: dict[str, Any]) -> torch.Tensor:
         tensor = inpt if isinstance(inpt, torch.Tensor) else F.to_image(inpt)
-        tensor = F.to_dtype(tensor, dtype=torch.float32, scale=not tensor.dtype.is_floating_point)
+        tensor = F.to_dtype(tensor, torch.float32, not tensor.dtype.is_floating_point)
         if not params.get("apply", False):
             return tensor
 
@@ -297,8 +297,8 @@ class ToBGRTensor(v2.Transform):
         tensor = inpt if isinstance(inpt, torch.Tensor) else F.to_image(inpt)
         tensor = F.to_dtype(
             tensor,
-            dtype=torch.float32,
-            scale=not tensor.dtype.is_floating_point,
+            torch.float32,
+            not tensor.dtype.is_floating_point,
         ).contiguous()
         if tensor.size(0) == 3:
             tensor = tensor[[2, 1, 0], :, :]
@@ -455,11 +455,11 @@ class WDTaggerImageProcessor(TimmWrapperImageProcessor):
         self.image_height, self.image_width = self._resolve_target_size()
         self._mean = torch.tensor(
             self.data_config.get("mean", (0.5, 0.5, 0.5)),
-            dtype=torch.float32,
+            torch.float32,
         ).view(3, 1, 1)
         self._std = torch.tensor(
             self.data_config.get("std", (0.5, 0.5, 0.5)),
-            dtype=torch.float32,
+            torch.float32,
         ).view(3, 1, 1)
         self._eval_interpolation = self._resolve_interpolation(
             self.data_config.get("interpolation", "bicubic"),

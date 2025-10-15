@@ -477,6 +477,16 @@ def train(
         hub_repo_id = training_args.hub_model_id or final_output_dir
         typer.echo(f"Uploading final model to {hub_repo_id}...")
         api = HfApi(token=token)
+
+        # Create repository if it doesn't exist
+        typer.echo(f"Ensuring repository {hub_repo_id} exists...")
+        api.create_repo(
+            repo_id=hub_repo_id,
+            token=token,
+            repo_type="model",
+            exist_ok=True,
+        )
+
         api.upload_folder(
             folder_path=str(output_dir_path),
             repo_id=hub_repo_id,
