@@ -21,7 +21,7 @@ A comprehensive toolset for fine-tuning and deploying WD Tagger models for image
 Clone the repository and install dependencies:
 
 ```bash
-git clone https://github.com/yourusername/WDTaggerAppend.git
+git clone https://github.com/nusu-github/WDTaggerAppend.git
 cd WDTaggerAppend
 uv sync
 ```
