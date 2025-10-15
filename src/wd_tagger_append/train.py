@@ -302,6 +302,14 @@ def train(
     # Set output directory
     if huggingface_account:
         final_output_dir = f"{huggingface_account}/{model_repo_id.split('/')[-1]}"
+    # Auto-complete username from Hub if push_to_hub is enabled
+    elif push_to_hub:
+        typer.echo("Fetching username from Hugging Face API...")
+        api = HfApi(token=token)
+        user_info = api.whoami()
+        username = user_info["name"]
+        final_output_dir = f"{username}/{model_repo_id.split('/')[-1]}"
+        typer.echo(f"Auto-completed repository: {final_output_dir}")
     else:
         final_output_dir = output_dir
     typer.echo(f"Output directory: {final_output_dir}")

@@ -218,7 +218,7 @@ def load_dataset_from_folder(
             seen_md5.add(md5)
             yield item
 
-    return cast(Dataset, Dataset.from_generator(sample_generator, features=BASE_DATASET_FEATURES))
+    return cast("Dataset", Dataset.from_generator(sample_generator, features=BASE_DATASET_FEATURES))
 
 
 def detect_dataset_source(dataset_source: str) -> DatasetSource:
@@ -284,6 +284,13 @@ def get_image_processor_size(
     processor: TimmWrapperImageProcessor,
 ) -> tuple[int, int]:
     """Extract the target image size from a Hugging Face image processor."""
+    # Try data_config first (for TimmWrapperImageProcessor)
+    if hasattr(processor, "data_config") and isinstance(processor.data_config, dict):
+        input_size = processor.data_config.get("input_size")
+        if isinstance(input_size, (list, tuple)) and len(input_size) == 3:
+            # Format is [channels, height, width]
+            return int(input_size[1]), int(input_size[2])
+
     size: dict[str, int] | Sequence[int] | int | None = getattr(
         processor,
         "crop_size",

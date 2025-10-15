@@ -40,9 +40,17 @@ def prepare(
     pretrained_labels = load_labels_from_hub(repo_id=model_repo_id)
     typer.echo(f"Pretrained labels: {pretrained_labels.num_labels}")
 
+    # Auto-complete username if not present in repo_id
+    api = HfApi(token=token)
+    if "/" not in repo_id:
+        typer.echo("Fetching username from Hugging Face API...")
+        user_info = api.whoami()
+        username = user_info["name"]
+        repo_id = f"{username}/{repo_id}"
+        typer.echo(f"Auto-completed repository: {repo_id}")
+
     # Create repository if it doesn't exist
     typer.echo(f"Creating repository: {repo_id}")
-    api = HfApi(token=token)
     try:
         api.create_repo(
             repo_id=repo_id,

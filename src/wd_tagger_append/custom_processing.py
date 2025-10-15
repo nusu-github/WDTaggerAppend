@@ -32,17 +32,22 @@ class EnsureRGB(v2.Transform):
             tensor_image = F.to_image(image)
 
         if tensor_image.shape[0] == 4:
-            alpha = tensor_image[3:4].to(torch.float32) / 255.0
-            rgb = tensor_image[:3].to(torch.float32)
+            alpha = F.to_dtype(tensor_image[3:4], dtype=torch.float32, scale=True)
+            rgb = F.to_dtype(tensor_image[:3], dtype=torch.float32, scale=True)
             alpha = alpha.expand_as(rgb)
-            composite = rgb * alpha + (1.0 - alpha) * 255.0
-            tensor_image = composite.round().to(torch.uint8)
+            composite = rgb * alpha + (1.0 - alpha)
+            tensor_image = composite
         elif tensor_image.shape[0] == 1:
             tensor_image = tensor_image.expand(3, -1, -1)
         elif tensor_image.shape[0] != 3:
             msg = f"Unsupported channel count: {tensor_image.shape[0]}"
             raise ValueError(msg)
-        return tensor_image[:3]
+        tensor_image = tensor_image[:3]
+        return F.to_dtype(
+            tensor_image,
+            dtype=torch.float32,
+            scale=not tensor_image.dtype.is_floating_point,
+        )
 
 
 class PadToSquare(v2.Transform):
@@ -54,6 +59,7 @@ class PadToSquare(v2.Transform):
 
     def transform(self, inpt: Any, params: dict[str, Any]) -> torch.Tensor:
         tensor = inpt if isinstance(inpt, torch.Tensor) else F.to_image(inpt)
+        tensor = F.to_dtype(tensor, dtype=torch.float32, scale=not tensor.dtype.is_floating_point)
         _, height, width = tensor.shape
         max_dim = int(max(height, width))
         pad_left = (max_dim - width) // 2
@@ -61,7 +67,10 @@ class PadToSquare(v2.Transform):
         pad_top = (max_dim - height) // 2
         pad_bottom = max_dim - height - pad_top
         if pad_left or pad_right or pad_top or pad_bottom:
-            tensor = F.pad(tensor, [pad_left, pad_top, pad_right, pad_bottom], fill=self.fill)
+            fill_value = float(self.fill)
+            if fill_value > 1.0:
+                fill_value /= 255.0
+            tensor = F.pad(tensor, [pad_left, pad_top, pad_right, pad_bottom], fill=fill_value)
         return tensor
 
 
@@ -78,6 +87,7 @@ class RandomHorizontalFlipTransform(v2.Transform):
 
     def transform(self, inpt: Any, params: dict[str, Any]) -> torch.Tensor:
         tensor = inpt if isinstance(inpt, torch.Tensor) else F.to_image(inpt)
+        tensor = F.to_dtype(tensor, dtype=torch.float32, scale=not tensor.dtype.is_floating_point)
         if not params.get("flip", False):
             return tensor
         return F.horizontal_flip(tensor)
@@ -121,6 +131,7 @@ class RandomSquareCropTransform(v2.Transform):
 
     def transform(self, inpt: Any, params: dict[str, Any]) -> torch.Tensor:
         tensor = inpt if isinstance(inpt, torch.Tensor) else F.to_image(inpt)
+        tensor = F.to_dtype(tensor, dtype=torch.float32, scale=not tensor.dtype.is_floating_point)
         if not params.get("crop", False):
             return tensor
         return F.crop(tensor, params["top"], params["left"], params["size"], params["size"])
@@ -141,12 +152,17 @@ class RandomRotationTransform(v2.Transform):
 
     def transform(self, inpt: Any, params: dict[str, Any]) -> torch.Tensor:
         tensor = inpt if isinstance(inpt, torch.Tensor) else F.to_image(inpt)
+        tensor = F.to_dtype(
+            tensor,
+            dtype=torch.float32,
+            scale=not tensor.dtype.is_floating_point,
+        ).contiguous()
         angle = params.get("angle", 0.0)
         if math.isclose(angle, 0.0, abs_tol=1e-3):
             return tensor
 
         channels = int(tensor.shape[0]) if tensor.ndim >= 3 else 1
-        fill_values = [255.0] * max(channels, 1)
+        fill_values = [1.0] * max(channels, 1)
         return F.rotate(
             tensor,
             angle,
@@ -182,14 +198,29 @@ class ResizeWithInterpolationTransform(v2.Transform):
 
     def transform(self, inpt: Any, params: dict[str, Any]) -> torch.Tensor:
         tensor = inpt if isinstance(inpt, torch.Tensor) else F.to_image(inpt)
+        tensor = F.to_dtype(tensor, dtype=torch.float32, scale=not tensor.dtype.is_floating_point)
         interpolation = params.get("interpolation", self.default_interpolation)
         target_height, target_width = self.size
-        return F.resize(
+
+        if interpolation == InterpolationMode.LANCZOS:
+            # Lanczos resizing does not support pytorch tensors directly
+            pil_img = F.to_pil_image(
+                F.to_dtype(tensor, dtype=torch.uint8, scale=True).contiguous(),
+            )
+            pil_img = pil_img.resize(
+                (target_width, target_height),
+                resample=Image.Resampling.LANCZOS,
+            )
+            resized = F.to_image(pil_img)
+            return F.to_dtype(resized, dtype=torch.float32, scale=True)
+
+        resized_tensor = F.resize(
             tensor,
             size=[target_height, target_width],
             interpolation=interpolation,
             antialias=True,
         )
+        return F.to_dtype(resized_tensor, dtype=torch.float32, scale=False)
 
 
 class RandomCutoutTransform(v2.Transform):
@@ -206,7 +237,7 @@ class RandomCutoutTransform(v2.Transform):
         self.probability = float(probability)
         self.min_ratio = float(min_ratio)
         self.max_ratio = float(max_ratio)
-        self.fill = int(fill)
+        self.fill = float(fill)
 
     def make_params(self, flat_inputs: list[Any]) -> dict[str, Any]:
         if not flat_inputs or self.probability <= 0.0:
@@ -242,11 +273,15 @@ class RandomCutoutTransform(v2.Transform):
 
     def transform(self, inpt: Any, params: dict[str, Any]) -> torch.Tensor:
         tensor = inpt if isinstance(inpt, torch.Tensor) else F.to_image(inpt)
+        tensor = F.to_dtype(tensor, dtype=torch.float32, scale=not tensor.dtype.is_floating_point)
         if not params.get("apply", False):
             return tensor
 
         cutout = tensor.clone()
-        cutout[:, params["y1"] : params["y2"], params["x1"] : params["x2"]] = self.fill
+        fill_value = float(self.fill)
+        if fill_value > 1.0:
+            fill_value /= 255.0
+        cutout[:, params["y1"] : params["y2"], params["x1"] : params["x2"]] = fill_value
         return cutout
 
 
@@ -260,7 +295,11 @@ class ToBGRTensor(v2.Transform):
 
     def transform(self, inpt: Any, params: dict[str, Any]) -> torch.Tensor:
         tensor = inpt if isinstance(inpt, torch.Tensor) else F.to_image(inpt)
-        tensor = tensor.to(dtype=torch.float32).div_(255.0).contiguous()
+        tensor = F.to_dtype(
+            tensor,
+            dtype=torch.float32,
+            scale=not tensor.dtype.is_floating_point,
+        ).contiguous()
         if tensor.size(0) == 3:
             tensor = tensor[[2, 1, 0], :, :]
             mean = cast("torch.Tensor", self.mean)

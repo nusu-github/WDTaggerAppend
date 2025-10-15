@@ -138,11 +138,19 @@ def upload_tags(  # noqa: PLR0913 - CLI surface is intentional
             resolved_output.unlink(missing_ok=True)
         return
 
+    # Auto-complete username if not present in repo_id
+    api = HfApi(token=token)
+    if "/" not in repo_id:
+        typer.echo("Fetching username from Hugging Face API...")
+        user_info = api.whoami()
+        username = user_info["name"]
+        repo_id = f"{username}/{repo_id}"
+        typer.echo(f"Auto-completed repository: {repo_id}")
+
     normalized_repo_path = repo_path.lstrip("/")
     message = commit_message or f"Upload {resolved_output.name}"
 
     typer.echo(f"Uploading to {repo_id}:{normalized_repo_path}")
-    api = HfApi(token=token)
 
     if create_repo:
         typer.echo(f"Ensuring repository exists: {repo_id}")
