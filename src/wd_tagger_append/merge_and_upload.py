@@ -7,7 +7,7 @@ from typing import Annotated
 import typer
 from huggingface_hub import HfApi
 from peft import PeftModel
-from transformers import AutoImageProcessor, AutoModelForImageClassification
+from transformers import AutoConfig, AutoImageProcessor, AutoModelForImageClassification
 
 from wd_tagger_append.model_export import (
     configure_model_for_remote,
@@ -49,8 +49,22 @@ def merge_and_upload(
 
     typer.echo(f"Target repository: {hub_repo_id}")
 
-    typer.echo(f"Loading base model: {base_model_repo_id}")
-    base_model = AutoModelForImageClassification.from_pretrained(base_model_repo_id)
+    # Read adapter config to get the correct number of labels
+    typer.echo(f"Loading adapter config from: {adapter_path}")
+    adapter_config = AutoConfig.from_pretrained(adapter_path)
+
+    num_labels = adapter_config.num_labels
+    label2id = getattr(adapter_config, "label2id", None)
+    id2label = getattr(adapter_config, "id2label", None)
+
+    typer.echo(f"Loading base model: {base_model_repo_id} with {num_labels} labels")
+    base_model = AutoModelForImageClassification.from_pretrained(
+        base_model_repo_id,
+        num_labels=num_labels,
+        label2id=label2id,
+        id2label=id2label,
+        ignore_mismatched_sizes=True,
+    )
 
     typer.echo(f"Loading PEFT adapter from: {adapter_path}")
     peft_model: PeftModel = PeftModel.from_pretrained(base_model, str(adapter_path))
@@ -77,10 +91,21 @@ def merge_and_upload(
         typer.echo(f"Copied custom processor code to {custom_processor_dest}")
 
         typer.echo(f"Uploading contents of {tmpdir} to {hub_repo_id}...")
-        api.create_repo(hub_repo_id, repo_type="model", exist_ok=True, private=private)
+
+        # Create repository if it doesn't exist
+        typer.echo(f"Ensuring repository {hub_repo_id} exists...")
+        api.create_repo(
+            repo_id=hub_repo_id,
+            token=token,
+            repo_type="model",
+            exist_ok=True,
+            private=private,
+        )
+
         api.upload_folder(
             repo_id=hub_repo_id,
             folder_path=tmpdir,
+            token=token,
             repo_type="model",
         )
 
