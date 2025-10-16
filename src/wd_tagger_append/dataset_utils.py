@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypedDict, cast
@@ -26,6 +26,7 @@ from datasets import (
     Value,
 )
 from wd_tagger_append.augmentations import AugmentationConfig, build_train_transform
+from wd_tagger_append.constants import RATING_LABELS
 from wd_tagger_append.custom_processing import resolve_interpolation
 
 if TYPE_CHECKING:
@@ -68,8 +69,6 @@ class DatasetSource(str, Enum):
     HUB = "hub"
 
 
-RATING_LABELS: tuple[str, ...] = ("general", "sensitive", "questionable", "explicit")
-
 BASE_DATASET_FEATURES = Features(
     {
         "md5": Value("string"),
@@ -79,6 +78,49 @@ BASE_DATASET_FEATURES = Features(
         "tags_character": DatasetSequence(Value("string")),
     },
 )
+
+
+@dataclass(slots=True, frozen=True)
+class ProcessorConfig:
+    """Extracted image processor configuration used for dataset transforms."""
+
+    size: tuple[int, int]
+    interpolation: InterpolationMode
+    mean: torch.Tensor
+    std: torch.Tensor
+
+
+def _extract_processor_config(processor: TimmWrapperImageProcessor) -> ProcessorConfig:
+    """Extract relevant configuration from an image processor."""
+    processor_height, processor_width = get_image_processor_size(processor)
+
+    interpolation_attr = getattr(processor, "_eval_interpolation", None)
+    if isinstance(interpolation_attr, InterpolationMode):
+        interpolation = interpolation_attr
+    else:
+        data_config = getattr(processor, "data_config", {})
+        interpolation = resolve_interpolation(str(data_config.get("interpolation", "bicubic")))
+
+    mean_tensor = getattr(processor, "_bgr_mean", None)
+    std_tensor = getattr(processor, "_bgr_std", None)
+    if isinstance(mean_tensor, torch.Tensor) and isinstance(std_tensor, torch.Tensor):
+        bgr_mean = mean_tensor.clone().detach()
+        bgr_std = std_tensor.clone().detach()
+    else:
+        data_config = getattr(processor, "data_config", {})
+        mean_values = data_config.get("mean", (0.5, 0.5, 0.5))
+        std_values = data_config.get("std", (0.5, 0.5, 0.5))
+        mean_t = torch.tensor(mean_values, dtype=torch.float32).view(3, 1, 1)
+        std_t = torch.tensor(std_values, dtype=torch.float32).view(3, 1, 1)
+        bgr_mean = mean_t.flip(0)
+        bgr_std = std_t.flip(0)
+
+    return ProcessorConfig(
+        size=(processor_height, processor_width),
+        interpolation=interpolation,
+        mean=bgr_mean,
+        std=bgr_std,
+    )
 
 
 def collect_image_paths(folder_path: str) -> list[str]:
@@ -337,39 +379,18 @@ def create_transform_function(
     Returns:
         Dataset transformation function
     """
-    target_height, target_width = config.size
-    processor_height, processor_width = get_image_processor_size(processor)
-    if (target_height, target_width) != (processor_height, processor_width):
-        config = replace(config, size=(processor_height, processor_width))
-        target_height, target_width = config.size
+    processor_config = _extract_processor_config(processor)
+    if config.size != processor_config.size:
+        config = replace(config, size=processor_config.size)
 
-    interpolation_attr = getattr(processor, "_eval_interpolation", None)
-    if isinstance(interpolation_attr, InterpolationMode):
-        interpolation = interpolation_attr
-    else:
-        data_config = getattr(processor, "data_config", {})
-        interpolation = resolve_interpolation(str(data_config.get("interpolation", "bicubic")))
-
-    mean_tensor = getattr(processor, "_bgr_mean", None)
-    std_tensor = getattr(processor, "_bgr_std", None)
-    if isinstance(mean_tensor, torch.Tensor) and isinstance(std_tensor, torch.Tensor):
-        bgr_mean = mean_tensor.clone().detach()
-        bgr_std = std_tensor.clone().detach()
-    else:
-        data_config = getattr(processor, "data_config", {})
-        mean_values = data_config.get("mean", (0.5, 0.5, 0.5))
-        std_values = data_config.get("std", (0.5, 0.5, 0.5))
-        mean_t = torch.tensor(mean_values, dtype=torch.float32).view(3, 1, 1)
-        std_t = torch.tensor(std_values, dtype=torch.float32).view(3, 1, 1)
-        bgr_mean = mean_t.flip(0)
-        bgr_std = std_t.flip(0)
-
-    interpolation_candidates = None if config.random_interpolation else (interpolation,)
+    interpolation_candidates = (
+        None if config.random_interpolation else (processor_config.interpolation,)
+    )
     transform_pipeline = build_train_transform(
         config,
-        default_interpolation=interpolation,
-        mean=bgr_mean,
-        std=bgr_std,
+        default_interpolation=processor_config.interpolation,
+        mean=processor_config.mean,
+        std=processor_config.std,
         interpolation_candidates=interpolation_candidates,
     )
 

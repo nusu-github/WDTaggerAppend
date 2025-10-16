@@ -8,6 +8,7 @@ import typer
 from huggingface_hub import HfApi
 from huggingface_hub.errors import HfHubHTTPError
 
+from wd_tagger_append.constants import DEFAULT_TAGS_FILENAME
 from wd_tagger_append.dataset_utils import (  # noqa: F401
     DatasetSource,
     analyze_new_tags,
@@ -22,8 +23,6 @@ from wd_tagger_append.labels import (
     labels_to_dataframe,
     load_labels_from_hub,
 )
-
-DEFAULT_TAGS_FILENAME = "selected_tags.csv"
 
 app = typer.Typer(help="Upload tag CSV files to the Hugging Face Hub")
 

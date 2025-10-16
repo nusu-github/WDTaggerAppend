@@ -6,10 +6,11 @@ import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
+from wd_tagger_append.constants import CUSTOM_PROCESSOR_FILENAME
+
 if TYPE_CHECKING:
     from transformers import PreTrainedModel
 
-CUSTOM_PROCESSOR_FILENAME: Final[str] = "processing_wd_tagger.py"
 _AUTO_MAP_ENTRY: Final[dict[str, str]] = {
     "AutoImageProcessor": "processing_wd_tagger.WDTaggerImageProcessor",
 }

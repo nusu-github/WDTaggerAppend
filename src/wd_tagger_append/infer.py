@@ -15,6 +15,7 @@ from transformers import (
 )
 
 from wd_tagger_append.labels import ModelLabels, load_labels_from_hub
+from wd_tagger_append.prediction import TagPredictionResult
 
 if TYPE_CHECKING:
     from peft import PeftModel
@@ -30,7 +31,7 @@ def get_tags(
     labels: ModelLabels,
     gen_threshold: float,
     char_threshold: float,
-) -> tuple[str, str, dict[str, float], dict[str, float], dict[str, float]]:
+) -> TagPredictionResult:
     """Extract tags from prediction results.
 
     Args:
@@ -40,7 +41,7 @@ def get_tags(
         char_threshold: Threshold for character tags
 
     Returns:
-        Tuple of (caption, taglist, rating_labels, char_labels, gen_labels)
+        Structured prediction results
     """
     # Convert indices and probabilities to labels
     label_probs: list[tuple[str, float]] = [
@@ -78,7 +79,13 @@ def get_tags(
     caption = ", ".join(combined_names)
     taglist = caption.replace("_", " ").replace("(", r"\(").replace(")", r"\)")
 
-    return caption, taglist, rating_labels, char_labels, gen_labels
+    return TagPredictionResult(
+        caption=caption,
+        taglist=taglist,
+        rating_labels=rating_labels,
+        character_labels=char_labels,
+        general_labels=gen_labels,
+    )
 
 
 @app.command()
@@ -162,33 +169,14 @@ def infer(
         typer.echo("Discarding stored tags (merge behaviour will be wired in a future update).")
     else:
         typer.echo("Keeping stored tags when merge support lands.")
-    caption, taglist, ratings, character, general = get_tags(
+    result = get_tags(
         probs=outputs.squeeze(0),
         labels=labels,
         gen_threshold=gen_threshold,
         char_threshold=char_threshold,
     )
 
-    typer.echo("--------")
-    typer.echo(f"Caption: {caption}")
-    typer.echo("--------")
-    typer.echo(f"Tags: {taglist}")
-
-    typer.echo("--------")
-    typer.echo("Ratings:")
-    for k, v in ratings.items():
-        typer.echo(f"  {k}: {v:.3f}")
-
-    typer.echo("--------")
-    typer.echo(f"Character tags (threshold={char_threshold}):")
-    for k, v in character.items():
-        typer.echo(f"  {k}: {v:.3f}")
-
-    typer.echo("--------")
-    typer.echo(f"General tags (threshold={gen_threshold}):")
-    for k, v in general.items():
-        typer.echo(f"  {k}: {v:.3f}")
-
+    typer.echo(result.format_summary())
     typer.echo("Done!")
 
 

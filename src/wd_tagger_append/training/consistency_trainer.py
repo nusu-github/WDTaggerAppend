@@ -69,6 +69,7 @@ class ConsistencyTrainer(Trainer):
         model: nn.Module,
         inputs: dict[str, Tensor],
         return_outputs: bool = False,
+        num_items_in_batch: Tensor | None = None,
     ) -> Tensor | tuple[Tensor, Any]:
         inputs = self._prepare_inputs(inputs)
         outputs = model(**inputs)
@@ -114,7 +115,7 @@ class ConsistencyTrainer(Trainer):
 
         if torch.isfinite(kl_term):
             scaled_penalty = scale * self.consistency.weight * kl_term.detach()
-            self.log({"loss_consistency": scaled_penalty})
+            self.log({"loss_consistency": float(scaled_penalty.item())})
 
         if return_outputs:
             outputs.loss = total_loss

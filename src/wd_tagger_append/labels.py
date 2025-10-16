@@ -9,6 +9,8 @@ import pandas as pd
 from huggingface_hub import hf_hub_download
 from huggingface_hub.errors import HfHubHTTPError
 
+from wd_tagger_append.constants import DEFAULT_TAGS_FILENAME, LabelCategory
+
 if TYPE_CHECKING:
     from pandas._typing import UsecolsArgType
 
@@ -90,11 +92,11 @@ def labels_to_dataframe(labels: ModelLabels) -> pd.DataFrame:
     """Convert a ModelLabels object to a pandas DataFrame."""
     category_map: dict[int, int] = {}
     for index in labels.rating_indices:
-        category_map[int(index)] = 9
+        category_map[int(index)] = LabelCategory.RATING.value
     for index in labels.general_indices:
-        category_map[int(index)] = 0
+        category_map[int(index)] = LabelCategory.GENERAL.value
     for index in labels.character_indices:
-        category_map[int(index)] = 4
+        category_map[int(index)] = LabelCategory.CHARACTER.value
 
     rows: list[dict[str, object]] = []
     for index, name in enumerate(labels.names):
@@ -125,7 +127,7 @@ def load_labels_from_hub(
     Raises:
         FileNotFoundError: If selected_tags.csv is not found
     """
-    tags_filename = "selected_tags.csv"
+    tags_filename = DEFAULT_TAGS_FILENAME
     local_path = Path(repo_id)
     if local_path.is_dir() and (local_path / tags_filename).exists():
         csv_path = (local_path / tags_filename).resolve()
@@ -146,9 +148,15 @@ def load_labels_from_hub(
     df: pd.DataFrame = pd.read_csv(csv_path, usecols=usecols)
     return ModelLabels(
         names=df["name"].tolist(),
-        rating_indices=list(np.where(df["category"] == 9)[0].astype(int)),
-        general_indices=list(np.where(df["category"] == 0)[0].astype(int)),
-        character_indices=list(np.where(df["category"] == 4)[0].astype(int)),
+        rating_indices=list(
+            np.where(df["category"] == LabelCategory.RATING.value)[0].astype(int),
+        ),
+        general_indices=list(
+            np.where(df["category"] == LabelCategory.GENERAL.value)[0].astype(int),
+        ),
+        character_indices=list(
+            np.where(df["category"] == LabelCategory.CHARACTER.value)[0].astype(int),
+        ),
     )
 
 

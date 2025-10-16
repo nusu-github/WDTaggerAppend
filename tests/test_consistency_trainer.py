@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from pathlib import Path
+from typing import cast
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -20,13 +23,21 @@ class DummyClassifier(nn.Module):
         labels: torch.Tensor | None = None,
     ) -> ImageClassifierOutput:
         logits = self.linear(pixel_values)
-        loss = None
+        loss_tensor: torch.FloatTensor | None = None
         if labels is not None:
-            loss = F.binary_cross_entropy_with_logits(logits, labels)
-        return ImageClassifierOutput(logits=logits, loss=loss)
+            loss_tensor = cast(
+                torch.FloatTensor,
+                F.binary_cross_entropy_with_logits(logits, labels),
+            )
+        return ImageClassifierOutput(logits=logits, loss=loss_tensor)
 
 
-def make_trainer(tmp_path, weight: float, warmup_ratio: float, teacher: nn.Module | None):
+def make_trainer(
+    tmp_path: Path,
+    weight: float,
+    warmup_ratio: float,
+    teacher: nn.Module | None,
+) -> tuple[DummyClassifier, ConsistencyTrainer]:
     args = TrainingArguments(
         output_dir=str(tmp_path),
         per_device_train_batch_size=2,
@@ -34,7 +45,7 @@ def make_trainer(tmp_path, weight: float, warmup_ratio: float, teacher: nn.Modul
         logging_steps=1,
         remove_unused_columns=False,
         report_to=[],
-        no_cuda=True,
+        use_cpu=True,
     )
     model = DummyClassifier()
     config = ConsistencyConfig(weight=weight, warmup_ratio=warmup_ratio, teacher=teacher)
@@ -45,14 +56,16 @@ def make_trainer(tmp_path, weight: float, warmup_ratio: float, teacher: nn.Modul
     )
 
 
-def test_consistency_penalty_matches_expected(tmp_path) -> None:
+def test_consistency_penalty_matches_expected(tmp_path: Path) -> None:
     student, trainer = make_trainer(
         tmp_path,
         weight=0.5,
         warmup_ratio=0.5,
         teacher=DummyClassifier(),
     )
-    trainer.consistency.teacher.load_state_dict(student.state_dict())
+    teacher_model = trainer.consistency.teacher
+    assert teacher_model is not None
+    teacher_model.load_state_dict(student.state_dict())
 
     trainer.state.max_steps = 10
     trainer.state.global_step = 2
@@ -63,8 +76,9 @@ def test_consistency_penalty_matches_expected(tmp_path) -> None:
     }
 
     student_outputs = student(**inputs)
+    assert student_outputs.loss is not None
     expected_base = student_outputs.loss
-    teacher_outputs = trainer.consistency.teacher(pixel_values=inputs["pixel_values"])
+    teacher_outputs = teacher_model(pixel_values=inputs["pixel_values"])
     student_prob = torch.sigmoid(student_outputs.logits)
     teacher_prob = torch.sigmoid(teacher_outputs.logits)
 
@@ -74,16 +88,21 @@ def test_consistency_penalty_matches_expected(tmp_path) -> None:
     expected_total = expected_base + trainer.consistency.weight * warmup_scale * kl_term
 
     total_loss = trainer.compute_loss(student, {k: v.clone() for k, v in inputs.items()})
+    assert isinstance(total_loss, torch.Tensor)
     assert torch.allclose(total_loss, expected_total, atol=1e-6)
 
 
-def test_zero_weight_skips_teacher(tmp_path) -> None:
+def test_zero_weight_skips_teacher(tmp_path: Path) -> None:
     student, trainer = make_trainer(tmp_path, weight=0.0, warmup_ratio=0.0, teacher=None)
     inputs = {
         "pixel_values": torch.randn(2, 4),
         "labels": torch.rand(2, 3),
     }
 
-    base_loss = student(**inputs).loss
+    student_outputs = student(**inputs)
+    assert student_outputs.loss is not None
+    base_loss = student_outputs.loss
+
     total_loss = trainer.compute_loss(student, {k: v.clone() for k, v in inputs.items()})
+    assert isinstance(total_loss, torch.Tensor)
     assert torch.allclose(total_loss, base_loss, atol=1e-6)
