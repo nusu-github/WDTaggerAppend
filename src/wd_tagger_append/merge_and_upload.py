@@ -5,7 +5,6 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
-from huggingface_hub import HfApi
 from peft import PeftModel
 from transformers import AutoConfig, AutoImageProcessor, AutoModelForImageClassification
 
@@ -41,12 +40,9 @@ def merge_and_upload(
         typer.echo(f"Error: Adapter path not found: {adapter_path}", err=True)
         raise typer.Exit(1)
 
-    # Get username from API
-    api = HfApi(token=token)
-    user_info = api.whoami()
-    username = user_info["name"]
-    hub_repo_id = f"{username}/{repo_name}"
-
+    # Construct the target repository ID
+    # The model's push_to_hub will auto-complete the username if needed
+    hub_repo_id = repo_name if "/" in repo_name else repo_name
     typer.echo(f"Target repository: {hub_repo_id}")
 
     # Read adapter config to get the correct number of labels
@@ -92,22 +88,41 @@ def merge_and_upload(
 
         typer.echo(f"Uploading contents of {tmpdir} to {hub_repo_id}...")
 
-        # Create repository if it doesn't exist
-        typer.echo(f"Ensuring repository {hub_repo_id} exists...")
-        api.create_repo(
+        # Use the high-level push_to_hub API from the model
+        # This automatically creates the repo if needed and handles username resolution
+        typer.echo(f"Pushing model to Hub: {hub_repo_id}")
+        merged_model.push_to_hub(  # pyright: ignore[reportAttributeAccessIssue]
             repo_id=hub_repo_id,
             token=token,
-            repo_type="model",
-            exist_ok=True,
             private=private,
+            commit_message="Upload merged model with custom processing code",
         )
 
-        api.upload_folder(
+        # Also push the processor separately to ensure all files are uploaded
+        processor.push_to_hub(
             repo_id=hub_repo_id,
-            folder_path=tmpdir,
             token=token,
-            repo_type="model",
+            commit_message="Upload image processor configuration",
         )
+
+        # For custom processing code, we still need upload_file
+        # since it's not part of the standard model/processor files
+        from huggingface_hub import HfApi
+
+        from wd_tagger_append.constants import CUSTOM_PROCESSOR_FILENAME
+
+        api = HfApi(token=token)
+        custom_file_path = tmpdir_path / CUSTOM_PROCESSOR_FILENAME
+        if custom_file_path.exists():
+            typer.echo(f"Uploading {CUSTOM_PROCESSOR_FILENAME}...")
+            api.upload_file(
+                path_or_fileobj=str(custom_file_path),
+                path_in_repo=CUSTOM_PROCESSOR_FILENAME,
+                repo_id=hub_repo_id,
+                token=token,
+                repo_type="model",
+                commit_message=f"Add {CUSTOM_PROCESSOR_FILENAME}",
+            )
 
     typer.echo("Done!")
     typer.echo(f"Your model is now available at: https://huggingface.co/{hub_repo_id}")

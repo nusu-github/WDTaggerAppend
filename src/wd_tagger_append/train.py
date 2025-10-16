@@ -19,7 +19,7 @@ from transformers import (
 
 from datasets import Dataset, Sequence as DatasetSequence, Value
 from wd_tagger_append.augmentations import AugmentationConfig
-from wd_tagger_append.constants import DEFAULT_TAGS_FILENAME
+from wd_tagger_append.constants import CUSTOM_PROCESSOR_FILENAME, DEFAULT_TAGS_FILENAME
 from wd_tagger_append.dataset_utils import (
     CollatorInputItem,
     DatasetSource,
@@ -112,7 +112,7 @@ def _vectorize_dataset_labels(
     typer.echo("Vectorizing labels once via dataset caching...")
     label_encoding_fn = create_label_encoding_function(extended_labels)
     updated_features = dataset.features.copy()
-    updated_features["labels"] = DatasetSequence(Value("float32"))
+    updated_features["labels"] = DatasetSequence(Value("bool"))
     vectorized = dataset.map(
         label_encoding_fn,
         batched=True,
@@ -239,23 +239,31 @@ def _determine_output_directory(
     push_to_hub: bool,
     model_repo_id: str,
     output_dir: str,
-    token: str | None,
-) -> str:
-    """Resolve the final output directory, auto-completing usernames when required."""
-    if huggingface_account:
-        final_output_dir = f"{huggingface_account}/{model_repo_id.split('/')[-1]}"
-    elif push_to_hub:
-        typer.echo("Fetching username from Hugging Face API...")
-        api = HfApi(token=token)
-        user_info = api.whoami()
-        username = user_info["name"]
-        final_output_dir = f"{username}/{model_repo_id.split('/')[-1]}"
-        typer.echo(f"Auto-completed repository: {final_output_dir}")
-    else:
-        final_output_dir = output_dir
+) -> tuple[str, str | None]:
+    """Resolve output directory and Hub repo ID.
 
-    typer.echo(f"Output directory: {final_output_dir}")
-    return final_output_dir
+    Returns:
+        Tuple of (local_output_dir, hub_repo_id).
+        hub_repo_id is None when push_to_hub is False.
+    """
+    if push_to_hub:
+        # For Hub upload, we use a temporary local directory
+        # and determine the Hub repo ID
+        local_dir = output_dir
+        if huggingface_account:
+            hub_repo = f"{huggingface_account}/{model_repo_id.split('/')[-1]}"
+        else:
+            # Use partial repo name; push_to_hub will auto-complete username
+            hub_repo = model_repo_id.split("/")[-1]
+            typer.echo(
+                f"Hub repository will be auto-completed from partial name: {hub_repo}",
+            )
+        typer.echo(f"Local output directory: {local_dir}")
+        typer.echo(f"Hub repository: {hub_repo}")
+        return local_dir, hub_repo
+    # Local-only mode
+    typer.echo(f"Output directory (local only): {output_dir}")
+    return output_dir, None
 
 
 def _validate_mixup_params(mixup: bool, mixup_alpha: float) -> None:
@@ -388,7 +396,7 @@ def _merge_and_push_to_hub(
     artifacts: ModelInitializationArtifacts,
     image_processor: TimmWrapperImageProcessor,
     output_dir_path: Path,
-    final_output_dir: str,
+    hub_repo_id: str,
     token: str | None,
     training_args: TrainingArguments,
 ) -> None:
@@ -436,24 +444,43 @@ def _merge_and_push_to_hub(
     labels_df.to_csv(output_csv_path, index=False)
     typer.echo(f"Extended labels saved to {output_csv_path}")
 
-    hub_repo_id = training_args.hub_model_id or final_output_dir
     typer.echo(f"Uploading final model to {hub_repo_id}...")
+
+    # Use push_to_hub for the model and processor (high-level API)
+    typer.echo("Pushing model to Hub...")
+    merged_model.push_to_hub(
+        repo_id=hub_repo_id,
+        token=token,
+        commit_message="Upload merged model after training",
+    )
+
+    typer.echo("Pushing processor to Hub...")
+    image_processor.push_to_hub(
+        repo_id=hub_repo_id,
+        token=token,
+        commit_message="Upload image processor",
+    )
     api = HfApi(token=token)
 
-    typer.echo(f"Ensuring repository exists: {hub_repo_id}")
-    api.create_repo(
-        repo_id=hub_repo_id,
-        token=token,
-        repo_type="model",
-        exist_ok=True,
-    )
+    # Upload custom processing code and labels CSV
+    custom_files_to_upload = [
+        (CUSTOM_PROCESSOR_FILENAME, CUSTOM_PROCESSOR_FILENAME),
+        (output_csv_path.name, DEFAULT_TAGS_FILENAME),
+    ]
 
-    api.upload_folder(
-        folder_path=str(output_dir_path),
-        repo_id=hub_repo_id,
-        token=token,
-        repo_type="model",
-    )
+    for local_name, repo_path in custom_files_to_upload:
+        local_file = output_dir_path / local_name
+        if local_file.exists():
+            typer.echo(f"Uploading {local_name} to {repo_path}...")
+            api.upload_file(
+                path_or_fileobj=str(local_file),
+                path_in_repo=repo_path,
+                repo_id=hub_repo_id,
+                token=token,
+                repo_type="model",
+                commit_message=f"Add {local_name}",
+            )
+
     typer.echo(f"Successfully uploaded merged model to https://huggingface.co/{hub_repo_id}")
 
 
@@ -643,14 +670,16 @@ def train(
         artifacts=artifacts,
     )
 
-    final_output_dir = _determine_output_directory(
+    local_output_dir, hub_repo_id = _determine_output_directory(
         huggingface_account=huggingface_account,
         push_to_hub=push_to_hub,
         model_repo_id=model_repo_id,
         output_dir=output_dir,
-        token=token,
     )
-    output_dir_path = Path(final_output_dir)
+    output_dir_path = Path(local_output_dir)
+    if push_to_hub and hub_repo_id is None:
+        typer.echo("Error: hub_repo_id not set despite push_to_hub=True", err=True)
+        raise typer.Exit(1)
 
     training_args = TrainingArguments(
         str(output_dir_path),
@@ -743,7 +772,7 @@ def train(
             artifacts=artifacts,
             image_processor=image_processor,
             output_dir_path=output_dir_path,
-            final_output_dir=final_output_dir,
+            hub_repo_id=hub_repo_id,
             token=token,
             training_args=training_args,
         )

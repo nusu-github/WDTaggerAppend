@@ -212,26 +212,26 @@ def create_label_encoding_function(
         tags_character_list = cast("list[list[str]]", batch["tags_character"])
         ratings = batch["rating"]
 
-        encoded_labels: list[list[float]] = []
+        encoded_labels: list[list[bool]] = []
         for general_tags, character_tags, rating in zip(
             tags_general_list,
             tags_character_list,
             ratings,
             strict=False,
         ):
-            label_vector = np.zeros(num_labels, dtype=np.float32)
+            label_vector = [False] * num_labels
 
             for tag in general_tags:
                 label_index = name_to_index[tag]
-                label_vector[label_index] = 1.0
+                label_vector[label_index] = True
 
             for tag in character_tags:
                 label_index = name_to_index[tag]
-                label_vector[label_index] = 1.0
+                label_vector[label_index] = True
 
             rating_label = _normalize_rating_value(rating)
-            label_vector[rating_map[rating_label]] = 1.0
-            encoded_labels.append(label_vector.tolist())
+            label_vector[rating_map[rating_label]] = True
+            encoded_labels.append(label_vector)
 
         return {"labels": encoded_labels}
 
@@ -405,14 +405,15 @@ def create_transform_function(
             raise KeyError(msg)
 
         processed_labels: list[NDArray[np.float32]] = []
-        for label_vector in cast("list[Any]", batch["labels"]):
-            label_array = np.asarray(label_vector, dtype=np.float32)
+        for label_vector in cast("list[bool]", batch["labels"]):
+            label_array = np.asarray(label_vector, dtype=bool)
             if label_array.shape != (expected_num_labels,):
                 msg = (
                     "Label vector has unexpected shape "
                     f"{label_array.shape}; expected ({expected_num_labels!s},)"
                 )
                 raise ValueError(msg)
+            label_array = label_array.astype(np.float32)
             processed_labels.append(label_array)
 
         batch["labels"] = processed_labels

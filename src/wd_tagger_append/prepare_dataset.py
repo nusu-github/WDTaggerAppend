@@ -4,7 +4,6 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
-from huggingface_hub import HfApi
 
 from wd_tagger_append.dataset_utils import load_dataset_from_folder
 from wd_tagger_append.labels import ModelName, get_model_repo_id, load_labels_from_hub
@@ -40,41 +39,22 @@ def prepare(
     pretrained_labels = load_labels_from_hub(repo_id=model_repo_id)
     typer.echo(f"Pretrained labels: {pretrained_labels.num_labels}")
 
-    # Auto-complete username if not present in repo_id
-    api = HfApi(token=token)
-    if "/" not in repo_id:
-        typer.echo("Fetching username from Hugging Face API...")
-        user_info = api.whoami()
-        username = user_info["name"]
-        repo_id = f"{username}/{repo_id}"
-        typer.echo(f"Auto-completed repository: {repo_id}")
-
-    # Create repository if it doesn't exist
-    typer.echo(f"Creating repository: {repo_id}")
-    try:
-        api.create_repo(
-            repo_id=repo_id,
-            repo_type="dataset",
-            private=private,
-            exist_ok=True,
-        )
-        typer.echo(f"Repository created/verified: {repo_id}")
-    except Exception as e:
-        typer.echo(f"Error creating repository: {e}", err=True)
-        raise typer.Exit(1) from e
-
     # Add metadata to dataset info
     dataset.info.description = f"Prepared dataset for WD Tagger training (based on {model_repo_id})"
 
     # Upload dataset to Hub
+    # push_to_hub automatically creates the repository if it doesn't exist
+    # and resolves partial repo_id (without username) using the token
     typer.echo(f"Uploading dataset to {repo_id}...")
     try:
-        dataset.push_to_hub(
+        result_repo_id = dataset.push_to_hub(
             repo_id=repo_id,
             private=private,
             token=token,
         )
-        typer.echo(f"Dataset successfully uploaded to: https://huggingface.co/datasets/{repo_id}")
+        typer.echo(
+            f"Dataset successfully uploaded to: https://huggingface.co/datasets/{result_repo_id}",
+        )
     except Exception as e:
         typer.echo(f"Error uploading dataset: {e}", err=True)
         raise typer.Exit(1) from e

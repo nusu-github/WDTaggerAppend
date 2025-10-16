@@ -137,15 +137,9 @@ def upload_tags(  # noqa: PLR0913 - CLI surface is intentional
             resolved_output.unlink(missing_ok=True)
         return
 
-    # Auto-complete username if not present in repo_id
+    # upload_file automatically handles repo creation if create_repo is enabled
+    # and resolves partial repo_id (without username) using the token
     api = HfApi(token=token)
-    if "/" not in repo_id:
-        typer.echo("Fetching username from Hugging Face API...")
-        user_info = api.whoami()
-        username = user_info["name"]
-        repo_id = f"{username}/{repo_id}"
-        typer.echo(f"Auto-completed repository: {repo_id}")
-
     normalized_repo_path = repo_path.lstrip("/")
     message = commit_message or f"Upload {resolved_output.name}"
 
@@ -154,12 +148,16 @@ def upload_tags(  # noqa: PLR0913 - CLI surface is intentional
     if create_repo:
         typer.echo(f"Ensuring repository exists: {repo_id}")
         try:
-            api.create_repo(
+            # create_repo with exist_ok=True is idempotent and safe
+            repo_url_result = api.create_repo(
                 repo_id=repo_id,
                 repo_type="dataset",
                 private=private,
                 exist_ok=True,
             )
+            # If repo_id was partial (e.g., "dataset-name"), normalize it from the result
+            if "/" not in repo_id and hasattr(repo_url_result, "repo_id"):
+                repo_id = repo_url_result.repo_id
             typer.echo("Repository is ready.")
         except Exception as exc:  # pragma: no cover - defensive, unexpected
             typer.echo(f"Failed to create or verify repository: {exc}", err=True)
