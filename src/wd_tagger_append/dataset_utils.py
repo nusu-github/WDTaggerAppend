@@ -6,16 +6,28 @@ and integration with training pipelines.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import numbers
+from collections import Counter
+from typing import TYPE_CHECKING, Any, cast
 
 import pandas as pd
 import torch
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Collection, Mapping, Sequence
     from pathlib import Path
 
     from datasets import Dataset
+
+
+VALID_TAG_CATEGORIES: tuple[str, ...] = ("rating", "general", "character")
+
+RATING_CODE_TO_NAME = {
+    "g": "general",
+    "s": "sensitive",
+    "q": "questionable",
+    "e": "explicit",
+}
 
 
 # WD Tagger category codes (matching original selected_tags.csv format)
@@ -26,26 +38,189 @@ CATEGORY_MAP = {
 }
 
 
-def create_label_mapping(dataset: Dataset) -> dict[str, int]:
+def _validate_categories(categories: Sequence[str] | None) -> tuple[str, ...]:
+    """Normalize and validate category selections."""
+    if categories is None:
+        return ("general", "character")
+
+    invalid = [category for category in categories if category not in VALID_TAG_CATEGORIES]
+    if invalid:
+        invalid_str = ", ".join(sorted(invalid))
+        msg = f"Unsupported tag categories: {invalid_str}"
+        raise ValueError(msg)
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for category in categories:
+        if category in seen:
+            continue
+        normalized.append(category)
+        seen.add(category)
+
+    return tuple(normalized)
+
+
+def _normalize_rating_value(value: Any) -> str | None:
+    """Return a normalized rating tag string or ``None`` if unavailable."""
+    if value is None:
+        return None
+
+    # ClassLabel values may arrive as ints; we cannot recover the string name here.
+    if isinstance(value, numbers.Integral):
+        return None
+
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            normalized = _normalize_rating_value(item)
+            if normalized is not None:
+                return normalized
+        return None
+
+    if not isinstance(value, str):
+        return None
+
+    candidate = value.strip()
+    if not candidate:
+        return None
+
+    return RATING_CODE_TO_NAME.get(candidate, candidate)
+
+
+def _extract_tags_from_example(example: Mapping[str, Any], categories: Sequence[str]) -> list[str]:
+    """Collect relevant tags from a dataset example."""
+    collected: list[str] = []
+    tags_dict = example.get("tags", {})
+
+    if "general" in categories:
+        collected.extend(tag for tag in tags_dict.get("general", []) if tag)
+
+    if "character" in categories:
+        collected.extend(tag for tag in tags_dict.get("character", []) if tag)
+
+    if "rating" in categories:
+        rating_sources = (
+            example.get("rating"),
+            tags_dict.get("rating"),
+        )
+        for source in rating_sources:
+            rating_tag = _normalize_rating_value(source)
+            if rating_tag is not None:
+                collected.append(rating_tag)
+                break
+
+    return collected
+
+
+def load_allowed_tags(path: Path) -> set[str]:
+    """Load a newline-delimited allow list of tags."""
+    allowed: set[str] = set()
+    with path.open(encoding="utf-8") as handle:
+        for raw_line in handle:
+            tag = raw_line.strip()
+            if not tag or tag.startswith("#"):
+                continue
+            allowed.add(tag)
+    return allowed
+
+
+def count_tag_frequencies(
+    dataset: Dataset,
+    categories: Sequence[str] | None = None,
+) -> Counter[str]:
+    """Count tag occurrences for the selected categories."""
+    active_categories = _validate_categories(categories)
+    frequencies: Counter[str] = Counter()
+    for example in dataset:
+        mapping_example = cast("Mapping[str, Any]", example)
+        for tag in _extract_tags_from_example(mapping_example, active_categories):
+            frequencies[tag] += 1
+    return frequencies
+
+
+def determine_tag_categories(
+    dataset: Dataset,
+    categories: Sequence[str] | None = None,
+) -> dict[str, str]:
+    """Determine which category each tag belongs to in the dataset.
+
+    For tags appearing in multiple categories, the first occurrence wins
+    (priority: rating > general > character).
+
+    Args:
+        dataset: Dataset containing tags in nested structure.
+        categories: Iterable of tag categories to consider.
+
+    Returns:
+        Dictionary mapping tag names to category names ('rating', 'general', 'character').
+    """
+    active_categories = _validate_categories(categories)
+    tag_to_category: dict[str, str] = {}
+
+    for example in dataset:
+        mapping_example = cast("Mapping[str, Any]", example)
+        tags_dict = mapping_example.get("tags", {})
+
+        # Priority order: rating first (most specific)
+        if "rating" in active_categories:
+            rating_sources = (
+                mapping_example.get("rating"),
+                tags_dict.get("rating") if isinstance(tags_dict, dict) else None,
+            )
+            for source in rating_sources:
+                rating_tag = _normalize_rating_value(source)
+                if rating_tag is not None and rating_tag not in tag_to_category:
+                    tag_to_category[rating_tag] = "rating"
+                break
+
+        # Then general tags
+        if "general" in active_categories and isinstance(tags_dict, dict):
+            for tag in tags_dict.get("general", []):
+                if tag and tag not in tag_to_category:
+                    tag_to_category[tag] = "general"
+
+        # Finally character tags
+        if "character" in active_categories and isinstance(tags_dict, dict):
+            for tag in tags_dict.get("character", []):
+                if tag and tag not in tag_to_category:
+                    tag_to_category[tag] = "character"
+
+    return tag_to_category
+
+
+def create_label_mapping(
+    dataset: Dataset,
+    categories: Sequence[str] | None = None,
+    *,
+    min_count: int = 1,
+    allowed_tags: Collection[str] | None = None,
+) -> tuple[dict[str, int], Counter[str]]:
     """Create a mapping from tag strings to label indices.
 
     Args:
         dataset: Dataset containing tags in nested structure.
+        categories: Iterable of tag categories to consider.
+        min_count: Minimum number of occurrences required to keep a tag.
+        allowed_tags: Optional allow list restricting tags to the provided set.
 
     Returns:
-        Dictionary mapping tag strings to integer indices.
+        Tuple of (label_mapping, tag_frequencies).
     """
-    all_tags = set()
+    if min_count < 1:
+        msg = "min_count must be >= 1"
+        raise ValueError(msg)
 
-    # Collect all unique tags from relevant categories only
-    for example in dataset:
-        tags_dict = example["tags"]  # type: ignore[index]
-        for category in ["general", "character"]:
-            all_tags.update(tags_dict[category])
+    active_categories = _validate_categories(categories)
+    frequencies = count_tag_frequencies(dataset, active_categories)
 
-    # Create sorted mapping for reproducibility
-    sorted_tags = sorted(all_tags)
-    return {tag: idx for idx, tag in enumerate(sorted_tags)}
+    filtered_tags = [
+        tag
+        for tag, count in frequencies.items()
+        if count >= min_count and (allowed_tags is None or tag in allowed_tags)
+    ]
+
+    sorted_tags = sorted(filtered_tags)
+    mapping = {tag: idx for idx, tag in enumerate(sorted_tags)}
+    return mapping, frequencies
 
 
 def save_labels_as_csv(
@@ -79,37 +254,51 @@ def save_labels_as_csv(
             "name": label_list,
             "category": [tag_to_category.get(tag, CATEGORY_MAP["general"]) for tag in label_list],
             "count": [0] * len(label_list),  # Placeholder; not computed from dataset
-        }
+        },
     )
 
     df.to_csv(output_path, index=False)
 
 
 def encode_multi_labels(
-    tags_dict: dict[str, list[str]],
+    tags_dict: Mapping[str, Any],
     label_mapping: dict[str, int],
+    categories: Sequence[str],
+    *,
+    rating_value: Any | None = None,
 ) -> torch.Tensor:
-    """Encode tags as multi-hot vector.
-
-    Args:
-        tags_dict: Dictionary with tag categories as keys and tag lists as values.
-        label_mapping: Dictionary mapping tag strings to indices.
-
-    Returns:
-        Multi-hot encoded tensor of shape (num_classes,).
-    """
+    """Encode tags as a multi-hot vector respecting category filters."""
     num_classes = len(label_mapping)
     labels = torch.zeros(num_classes, dtype=torch.float32)
 
-    # Collect all tags from relevant categories only
-    all_tags = []
-    for category in ["general", "character"]:
-        all_tags.extend(tags_dict.get(category, []))
-
-    # Set corresponding indices to 1
-    for tag in all_tags:
+    def add_tag(tag: str | None) -> None:
+        if tag is None:
+            return
         if tag in label_mapping:
             labels[label_mapping[tag]] = 1.0
+
+    if "general" in categories:
+        for tag in tags_dict.get("general", []):
+            add_tag(tag)
+
+    if "character" in categories:
+        for tag in tags_dict.get("character", []):
+            add_tag(tag)
+
+    if "rating" in categories:
+        rating_candidates: list[Any] = []
+        if rating_value is not None:
+            rating_candidates.append(rating_value)
+
+        rating_field = tags_dict.get("rating")
+        if rating_field is not None:
+            rating_candidates.append(rating_field)
+
+        for candidate in rating_candidates:
+            normalized = _normalize_rating_value(candidate)
+            if normalized is not None:
+                add_tag(normalized)
+                break
 
     return labels
 
@@ -117,16 +306,19 @@ def encode_multi_labels(
 def create_transform_function(
     transform: Callable,
     label_mapping: dict[str, int],
+    categories: Sequence[str],
 ) -> Callable:
     """Create a transform function for use with Dataset.set_transform.
 
     Args:
         transform: Transform function to apply to images (from augmentation.py).
         label_mapping: Dictionary mapping tag strings to indices.
+        categories: Sequence of tag categories to encode.
 
     Returns:
         Transform function compatible with Dataset.set_transform.
     """
+    active_categories = _validate_categories(categories)
 
     def transform_function(examples: dict) -> dict:
         """Apply transforms and encode labels.
@@ -142,7 +334,19 @@ def create_transform_function(
         examples["pixel_values"] = torch.stack(images)
 
         # Encode multi-labels
-        labels = [encode_multi_labels(tags, label_mapping) for tags in examples["tags"]]
+        ratings = examples.get("rating")
+        rating_values = ratings if isinstance(ratings, list) else None
+
+        labels = []
+        for index, tags in enumerate(examples["tags"]):
+            rating_value = rating_values[index] if rating_values is not None else None
+            encoded = encode_multi_labels(
+                tags,
+                label_mapping,
+                active_categories,
+                rating_value=rating_value,
+            )
+            labels.append(encoded)
         examples["labels"] = torch.stack(labels)
 
         # Remove unnecessary fields to save memory
@@ -164,7 +368,7 @@ def get_dataset_statistics(dataset: Dataset) -> dict:
     """
     stats = {
         "num_examples": len(dataset),
-        "tag_counts": {"general": 0, "character": 0},
+        "tag_counts": {"general": 0, "character": 0, "rating": 0},
         "rating_distribution": {},
     }
 
@@ -173,7 +377,14 @@ def get_dataset_statistics(dataset: Dataset) -> dict:
         # Count tags per category
         tags_dict = example["tags"]  # type: ignore[index]
         for category in stats["tag_counts"]:
-            stats["tag_counts"][category] += len(tags_dict[category])
+            if category in ("general", "character"):
+                stats["tag_counts"][category] += len(tags_dict.get(category, []))
+
+        if "rating" in stats["tag_counts"]:
+            rating_tag = example.get("rating")  # type: ignore[index]
+            normalized = _normalize_rating_value(rating_tag)
+            if normalized is not None:
+                stats["tag_counts"]["rating"] += 1
 
         # Count ratings
         rating = example["rating"]  # type: ignore[index]

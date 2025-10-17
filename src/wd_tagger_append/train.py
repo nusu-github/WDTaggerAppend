@@ -31,6 +31,8 @@ from wd_tagger_append.augmentation import (
 from wd_tagger_append.dataset_utils import (
     create_label_mapping,
     create_transform_function,
+    determine_tag_categories,
+    load_allowed_tags,
     save_labels_as_csv,
 )
 from wd_tagger_append.infer import MODEL_REPO_MAP, load_labels_hf
@@ -136,9 +138,13 @@ def _merge_label_lists(
     return merged
 
 
-def _wrap_transform(transform: Callable, label_mapping: dict[str, int]) -> Callable:
+def _wrap_transform(
+    transform: Callable,
+    label_mapping: dict[str, int],
+    categories: Sequence[str],
+) -> Callable:
     """Wrap dataset transform to drop unused metadata columns."""
-    base_transform = create_transform_function(transform, label_mapping)
+    base_transform = create_transform_function(transform, label_mapping, categories)
 
     def _transform(examples: dict) -> dict:
         processed = base_transform(examples)
@@ -284,6 +290,46 @@ def main(
     dataset_config: Annotated[
         str | None,
         typer.Option("--dataset-config", help="Optional dataset config name."),
+    ] = None,
+    min_tag_count: Annotated[
+        int,
+        typer.Option(
+            "--min-tag-count",
+            min=1,
+            help="Minimum occurrence count required for dataset tags.",
+        ),
+    ] = 1,
+    rating: Annotated[
+        bool,
+        typer.Option(
+            "--rating/--no-rating",
+            help="Include rating tags when building training labels.",
+        ),
+    ] = True,
+    general: Annotated[
+        bool,
+        typer.Option(
+            "--general/--no-general",
+            help="Include general tags when building training labels.",
+        ),
+    ] = True,
+    character: Annotated[
+        bool,
+        typer.Option(
+            "--character/--no-character",
+            help="Include character tags when building training labels.",
+        ),
+    ] = True,
+    allowed_tags_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--allowed-tags-file",
+            help="Optional newline-delimited file restricting tags used for training.",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            resolve_path=True,
+        ),
     ] = None,
     train_split: Annotated[
         str,
@@ -460,7 +506,55 @@ def main(
     else:
         combined = splits.train
 
-    dataset_label_mapping = create_label_mapping(combined)
+    category_flags = {
+        "rating": rating,
+        "general": general,
+        "character": character,
+    }
+    category_order = ("rating", "general", "character")
+    selected_categories = [name for name in category_order if category_flags[name]]
+    if not selected_categories:
+        msg = "At least one tag category must remain enabled."
+        _raise_bad_parameter(msg)  # pyright: ignore[reportGeneralTypeIssues]
+
+    allow_list: set[str] | None = None
+    if allowed_tags_file is not None:
+        allow_list = load_allowed_tags(allowed_tags_file)
+        if not allow_list:
+            msg = (
+                f"No tags found in {allowed_tags_file}. Provide a file containing at least one tag."
+            )
+            _raise_bad_parameter(msg)  # pyright: ignore[reportGeneralTypeIssues]
+
+    dataset_label_mapping, tag_frequencies = create_label_mapping(
+        combined,
+        categories=selected_categories,
+        min_count=min_tag_count,
+        allowed_tags=allow_list,
+    )
+
+    if not dataset_label_mapping:
+        msg = "No dataset tags remain after applying filters."
+        if allow_list is not None:
+            msg += " Adjust --allowed-tags-file to match dataset tags."
+        if min_tag_count > 1:
+            msg += " Consider lowering --min-tag-count."
+        _raise_bad_parameter(msg)  # pyright: ignore[reportGeneralTypeIssues]
+
+    typer.echo("Active tag categories: " + ", ".join(selected_categories))
+    typer.echo(
+        "Dataset tag filter -> min-count "
+        f"{min_tag_count} | kept {len(dataset_label_mapping)} of {len(tag_frequencies)} tags",
+    )
+
+    if allow_list is not None:
+        retained = len(dataset_label_mapping)
+        missing = len(allow_list.difference(dataset_label_mapping.keys()))
+        typer.echo(
+            f"Allow list matched {retained} tags; {missing} from {allowed_tags_file} "
+            "were not present in the dataset.",
+        )
+
     base_label_data = load_labels_hf(repo_id=repo_id, revision=base_revision, token=hub_token)
     base_labels = base_label_data.names
     label_list = _merge_label_lists(base_labels, dataset_label_mapping.keys())
@@ -480,6 +574,9 @@ def main(
     base_character_tags = {base_labels[idx] for idx in base_label_data.character}
     base_rating_tags = {base_labels[idx] for idx in base_label_data.rating}
 
+    # Determine dataset tag categories
+    dataset_tag_categories = determine_tag_categories(combined, categories=selected_categories)
+
     # Categorize all labels
     general_tags = []
     character_tags = []
@@ -493,8 +590,14 @@ def main(
         elif tag in base_general_tags:
             general_tags.append(tag)
         else:
-            # New tags from dataset default to general category
-            general_tags.append(tag)
+            # New tags from dataset: use dataset category
+            dataset_category = dataset_tag_categories.get(tag, "general")
+            if dataset_category == "rating":
+                rating_tags.append(tag)
+            elif dataset_category == "character":
+                character_tags.append(tag)
+            else:
+                general_tags.append(tag)
 
     tag_categories = {
         "rating": rating_tags,
@@ -508,11 +611,15 @@ def main(
     train_transform = create_train_transform(
         pretrained_model_name_or_path=repo_id,
     )
-    train_dataset = splits.train.with_transform(_wrap_transform(train_transform, label2id))
+    train_dataset = splits.train.with_transform(
+        _wrap_transform(train_transform, label2id, selected_categories),
+    )
     eval_dataset = None
     if splits.eval is not None:
         eval_transform = create_eval_transform(pretrained_model_name_or_path=repo_id)
-        eval_dataset = splits.eval.with_transform(_wrap_transform(eval_transform, label2id))
+        eval_dataset = splits.eval.with_transform(
+            _wrap_transform(eval_transform, label2id, selected_categories),
+        )
 
     bf16, fp16, precision_dtype = _parse_precision(precision)
     quant_config = _create_quantization_config(

@@ -7,7 +7,6 @@ into Hugging Face Datasets format with MD5-based deduplication.
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import TYPE_CHECKING, Annotated
 
 import typer
@@ -17,6 +16,7 @@ from datasets import ClassLabel, Dataset, DatasetDict, Features, Image, Sequence
 
 if TYPE_CHECKING:
     from collections.abc import Generator
+    from pathlib import Path
 
 app = typer.Typer(help="Prepare WD Tagger datasets from image folders")
 

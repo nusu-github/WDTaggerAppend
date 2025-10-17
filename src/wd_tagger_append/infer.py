@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, cast
 
 import numpy as np
 import pandas as pd
@@ -352,13 +352,26 @@ def main(
             revision=adapter_revision,
             token=adapter_token_final,
         )
-        adapter_base = peft_config.base_model_name_or_path
+        adapter_base = cast(str, peft_config.base_model_name_or_path)
         if repo_id is None and model in MODEL_REPO_MAP:
             base_identifier = adapter_base
         typer.echo(
             "Adapter trained on base model "
             f"'{adapter_base}'. Using '{base_identifier}' for inference.",
         )
+
+    # Load label metadata first to determine num_labels for model initialization
+    typer.echo("Loading label metadata...")
+    labels: LabelData = _load_label_data(
+        base_repo=base_identifier,
+        revision=revision,
+        token=token,
+        labels_path=labels_path,
+        adapter=adapter,
+        adapter_revision=adapter_revision,
+        adapter_token=adapter_token_final,
+        fallback_repo=(peft_config.base_model_name_or_path if peft_config is not None else None),
+    )
 
     precision_dtype = _parse_precision(precision)
     quantization_config = _create_quantization_config(load_in_4bit, load_in_8bit, precision_dtype)
@@ -375,7 +388,12 @@ def main(
     if revision is not None and not _is_local_path(base_identifier):
         base_kwargs["revision"] = revision
 
-    typer.echo(f"Loading base model from '{base_identifier}'...")
+    # Specify num_labels to automatically expand classification head if needed
+    num_labels = len(labels.names)
+    base_kwargs["num_labels"] = num_labels
+    base_kwargs["ignore_mismatched_sizes"] = True
+
+    typer.echo(f"Loading base model from '{base_identifier}' with {num_labels} labels...")
     hf_model = AutoModelForImageClassification.from_pretrained(
         base_identifier,
         **base_kwargs,
@@ -391,18 +409,6 @@ def main(
         hf_model = PeftModel.from_pretrained(hf_model, adapter, **adapter_kwargs)
 
     hf_model = hf_model.eval()
-
-    typer.echo("Loading label metadata...")
-    labels: LabelData = _load_label_data(
-        base_repo=base_identifier,
-        revision=revision,
-        token=token,
-        labels_path=labels_path,
-        adapter=adapter,
-        adapter_revision=adapter_revision,
-        adapter_token=adapter_token_final,
-        fallback_repo=(peft_config.base_model_name_or_path if peft_config is not None else None),
-    )
 
     typer.echo("Creating data transform...")
     transforms = create_eval_transform(base_identifier)

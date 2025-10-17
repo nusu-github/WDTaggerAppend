@@ -109,21 +109,11 @@ def create_compute_metrics_fn(
         logits_tensor = torch.from_numpy(logits)
         labels_tensor = torch.from_numpy(labels)
 
-        # Apply sigmoid to logits to get probabilities (JAX-CV: from_logits=True)
-        probs = torch.sigmoid(logits_tensor)
-
-        # JAX-CV applies threshold to BOTH predictions and labels
-        # This supports soft labels (continuous values 0.0-1.0)
-        # For hard labels (0 or 1), labels > threshold is effectively labels == 1
-        # See ConfusionMatrix.py: labels = labels > threshold
-        binary_preds = (probs > threshold).int()
-        binary_labels = (labels_tensor > threshold).int()
-
         # Compute metrics on binarized predictions and labels
-        f1_score = f1_metric(binary_preds, binary_labels)
-        mcc_score = mcc_metric(binary_preds, binary_labels)
-        precision_score = precision_metric(binary_preds, binary_labels)
-        recall_score = recall_metric(binary_preds, binary_labels)
+        f1_score = f1_metric(logits_tensor, labels_tensor)
+        mcc_score = mcc_metric(logits_tensor, labels_tensor)
+        precision_score = precision_metric(logits_tensor, labels_tensor)
+        recall_score = recall_metric(logits_tensor, labels_tensor)
 
         # BCE uses raw logits and labels (no thresholding)
         bce_score = bce_metric(logits_tensor, labels_tensor.float())

@@ -68,7 +68,7 @@ explicit = true
 
 [project.scripts]
 wd-tagger-prepare = "wd_tagger_append.prepare_dataset:app"
-wd-tagger-infer = "wd_tagger_append.infer:main"
+wd-tagger-infer = "wd_tagger_append.infer:app"
 wd-tagger-train = "wd_tagger_append.train:app"
 
 [dependency-groups]
