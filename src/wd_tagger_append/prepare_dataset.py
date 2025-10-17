@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, cast
 
 import typer
-from PIL import Image as PILImage
 
 from datasets import ClassLabel, Dataset, DatasetDict, Features, Image, Sequence, Value
 from wd_tagger_append.dataset_utils import RATING_CODE_TO_NAME
@@ -34,10 +33,10 @@ def get_dataset_features() -> Features:
             "md5": Value("string"),
             "source": Value("string"),
             "image": Image(),
+            "rating": ClassLabel(names=list(RATING_CODE_TO_NAME.values())),
             "tags": {
                 "general": Sequence(Value("string")),
                 "character": Sequence(Value("string")),
-                "rating": ClassLabel(names=list(RATING_CODE_TO_NAME.values())),
             },
             "score": Value("int32"),
         },
@@ -108,10 +107,10 @@ def parse_danbooru_json(json_path: Path) -> dict:
     # Extract tag strings with fallback to empty string
     return {
         "md5": data["md5"],
+        "rating": data["rating"],
         "score": data.get("score", 0),
         "source": data.get("source", ""),
         "tags": {
-            "rating": data["rating"],
             "general": data.get("tag_string_general", "").split(),
             "character": data.get("tag_string_character", "").split(),
         },
@@ -147,19 +146,12 @@ def create_dataset_generator(
 
             seen_md5.add(md5_hash)
 
-            # Load image
-            image = PILImage.open(image_path)
-
             # Convert rating code to full name
             rating = RATING_CODE_TO_NAME.get(metadata["rating"], "general")
 
-            # Add rating to tags dict for consistent structure
-            tags_with_rating = metadata["tags"].copy()
-            tags_with_rating["rating"] = [rating]
-
             yield {
-                "image": image,
-                "tags": tags_with_rating,
+                "image": image_path,
+                "tags": metadata["tags"],
                 "rating": rating,
                 "score": metadata["score"],
                 "source": metadata["source"],

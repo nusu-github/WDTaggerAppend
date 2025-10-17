@@ -125,15 +125,10 @@ def count_tag_frequencies(
                 example_tags.extend(tag for tag in tags_dict.get("character", []) if tag)
 
             if "rating" in active_categories:
-                rating_sources = (
-                    examples.get("rating", [None])[i] if "rating" in examples else None,
-                    tags_dict.get("rating"),
-                )
-                for source in rating_sources:
-                    rating_tag = _normalize_rating_value(source)
-                    if rating_tag is not None:
-                        example_tags.append(rating_tag)
-                        break
+                rating_value = examples.get("rating", [None])[i] if "rating" in examples else None
+                rating_tag = _normalize_rating_value(rating_value)
+                if rating_tag is not None:
+                    example_tags.append(rating_tag)
 
             all_tags.append(example_tags)
 
@@ -186,15 +181,10 @@ def determine_tag_categories(
 
             # Priority order: rating first (most specific)
             if "rating" in active_categories:
-                rating_sources = (
-                    examples.get("rating", [None])[i] if "rating" in examples else None,
-                    tags_dict.get("rating") if isinstance(tags_dict, dict) else None,
-                )
-                for source in rating_sources:
-                    rating_tag = _normalize_rating_value(source)
-                    if rating_tag is not None:
-                        categorized["rating"].append(rating_tag)
-                        break
+                rating_value = examples.get("rating", [None])[i] if "rating" in examples else None
+                rating_tag = _normalize_rating_value(rating_value)
+                if rating_tag is not None:
+                    categorized["rating"].append(rating_tag)
 
             # Then general tags
             if "general" in active_categories and isinstance(tags_dict, dict):
@@ -332,20 +322,10 @@ def encode_multi_labels(
         for tag in tags_dict.get("character", []):
             add_tag(tag)
 
-    if "rating" in categories:
-        rating_candidates: list[Any] = []
-        if rating_value is not None:
-            rating_candidates.append(rating_value)
-
-        rating_field = tags_dict.get("rating")
-        if rating_field is not None:
-            rating_candidates.append(rating_field)
-
-        for candidate in rating_candidates:
-            normalized = _normalize_rating_value(candidate)
-            if normalized is not None:
-                add_tag(normalized)
-                break
+    if "rating" in categories and rating_value is not None:
+        normalized = _normalize_rating_value(rating_value)
+        if normalized is not None:
+            add_tag(normalized)
 
     return labels
 
