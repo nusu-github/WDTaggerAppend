@@ -8,16 +8,16 @@ from __future__ import annotations
 
 import numbers
 from collections import Counter
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 import pandas as pd
 import torch
 
+from datasets import Dataset, Image
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Collection, Mapping, Sequence
     from pathlib import Path
-
-    from datasets import Dataset
 
 
 VALID_TAG_CATEGORIES: tuple[str, ...] = ("rating", "general", "character")
@@ -86,31 +86,6 @@ def _normalize_rating_value(value: Any) -> str | None:
     return RATING_CODE_TO_NAME.get(candidate, candidate)
 
 
-def _extract_tags_from_example(example: Mapping[str, Any], categories: Sequence[str]) -> list[str]:
-    """Collect relevant tags from a dataset example."""
-    collected: list[str] = []
-    tags_dict = example.get("tags", {})
-
-    if "general" in categories:
-        collected.extend(tag for tag in tags_dict.get("general", []) if tag)
-
-    if "character" in categories:
-        collected.extend(tag for tag in tags_dict.get("character", []) if tag)
-
-    if "rating" in categories:
-        rating_sources = (
-            example.get("rating"),
-            tags_dict.get("rating"),
-        )
-        for source in rating_sources:
-            rating_tag = _normalize_rating_value(source)
-            if rating_tag is not None:
-                collected.append(rating_tag)
-                break
-
-    return collected
-
-
 def load_allowed_tags(path: Path) -> set[str]:
     """Load a newline-delimited allow list of tags."""
     allowed: set[str] = set()
@@ -127,13 +102,53 @@ def count_tag_frequencies(
     dataset: Dataset,
     categories: Sequence[str] | None = None,
 ) -> Counter[str]:
-    """Count tag occurrences for the selected categories."""
+    """Count tag occurrences for the selected categories.
+
+    Optimized implementation using Dataset.map with batched=True for performance.
+    """
     active_categories = _validate_categories(categories)
     frequencies: Counter[str] = Counter()
-    for example in dataset:
-        mapping_example = cast("Mapping[str, Any]", example)
-        for tag in _extract_tags_from_example(mapping_example, active_categories):
+
+    def extract_tags_batch(examples: dict[str, Any]) -> dict[str, list[list[str]]]:
+        """Extract tags from a batch of examples."""
+        batch_size = len(examples.get("tags", []))
+        all_tags = []
+
+        for i in range(batch_size):
+            tags_dict = examples["tags"][i] if "tags" in examples else {}
+            example_tags = []
+
+            if "general" in active_categories:
+                example_tags.extend(tag for tag in tags_dict.get("general", []) if tag)
+
+            if "character" in active_categories:
+                example_tags.extend(tag for tag in tags_dict.get("character", []) if tag)
+
+            if "rating" in active_categories:
+                rating_sources = (
+                    examples.get("rating", [None])[i] if "rating" in examples else None,
+                    tags_dict.get("rating"),
+                )
+                for source in rating_sources:
+                    rating_tag = _normalize_rating_value(source)
+                    if rating_tag is not None:
+                        example_tags.append(rating_tag)
+                        break
+
+            all_tags.append(example_tags)
+
+        return {"extracted_tags": all_tags}
+
+    # Use map with batched=True for performance
+    dataset = dataset.cast_column("image", Image(decode=False))
+    processed = dataset.map(extract_tags_batch, batched=True)
+
+    # Aggregate frequencies
+    for example in processed:
+        tags_list = example["extracted_tags"]  # type: ignore[index]
+        for tag in tags_list:
             frequencies[tag] += 1
+
     return frequencies
 
 
@@ -146,6 +161,8 @@ def determine_tag_categories(
     For tags appearing in multiple categories, the first occurrence wins
     (priority: rating > general > character).
 
+    Optimized implementation using Dataset.map with batched=True for performance.
+
     Args:
         dataset: Dataset containing tags in nested structure.
         categories: Iterable of tag categories to consider.
@@ -156,33 +173,63 @@ def determine_tag_categories(
     active_categories = _validate_categories(categories)
     tag_to_category: dict[str, str] = {}
 
-    for example in dataset:
-        mapping_example = cast("Mapping[str, Any]", example)
-        tags_dict = mapping_example.get("tags", {})
+    def extract_categorized_tags_batch(
+        examples: dict[str, Any],
+    ) -> dict[str, list[dict[str, list[str]]]]:
+        """Extract tags by category from a batch of examples."""
+        batch_size = len(examples.get("tags", []))
+        categorized_batch = []
 
-        # Priority order: rating first (most specific)
-        if "rating" in active_categories:
-            rating_sources = (
-                mapping_example.get("rating"),
-                tags_dict.get("rating") if isinstance(tags_dict, dict) else None,
-            )
-            for source in rating_sources:
-                rating_tag = _normalize_rating_value(source)
-                if rating_tag is not None and rating_tag not in tag_to_category:
-                    tag_to_category[rating_tag] = "rating"
-                break
+        for i in range(batch_size):
+            tags_dict = examples["tags"][i] if "tags" in examples else {}
+            categorized = {"rating": [], "general": [], "character": []}
 
-        # Then general tags
-        if "general" in active_categories and isinstance(tags_dict, dict):
-            for tag in tags_dict.get("general", []):
-                if tag and tag not in tag_to_category:
-                    tag_to_category[tag] = "general"
+            # Priority order: rating first (most specific)
+            if "rating" in active_categories:
+                rating_sources = (
+                    examples.get("rating", [None])[i] if "rating" in examples else None,
+                    tags_dict.get("rating") if isinstance(tags_dict, dict) else None,
+                )
+                for source in rating_sources:
+                    rating_tag = _normalize_rating_value(source)
+                    if rating_tag is not None:
+                        categorized["rating"].append(rating_tag)
+                        break
 
-        # Finally character tags
-        if "character" in active_categories and isinstance(tags_dict, dict):
-            for tag in tags_dict.get("character", []):
-                if tag and tag not in tag_to_category:
-                    tag_to_category[tag] = "character"
+            # Then general tags
+            if "general" in active_categories and isinstance(tags_dict, dict):
+                categorized["general"].extend(tag for tag in tags_dict.get("general", []) if tag)
+
+            # Finally character tags
+            if "character" in active_categories and isinstance(tags_dict, dict):
+                categorized["character"].extend(
+                    tag for tag in tags_dict.get("character", []) if tag
+                )
+
+            categorized_batch.append(categorized)
+
+        return {"categorized_tags": categorized_batch}
+
+    # Use map with batched=True for performance
+    dataset = dataset.cast_column("image", Image(decode=False))
+    processed = dataset.map(extract_categorized_tags_batch, batched=True)
+
+    # Aggregate with priority (first occurrence wins)
+    for example in processed:
+        categorized = example["categorized_tags"]  # type: ignore[index]
+
+        # Priority: rating > general > character
+        for tag in categorized.get("rating", []):
+            if tag not in tag_to_category:
+                tag_to_category[tag] = "rating"
+
+        for tag in categorized.get("general", []):
+            if tag not in tag_to_category:
+                tag_to_category[tag] = "general"
+
+        for tag in categorized.get("character", []):
+            if tag not in tag_to_category:
+                tag_to_category[tag] = "character"
 
     return tag_to_category
 

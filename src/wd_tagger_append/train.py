@@ -36,6 +36,7 @@ from wd_tagger_append.dataset_utils import (
     save_labels_as_csv,
 )
 from wd_tagger_append.infer import MODEL_REPO_MAP, load_labels_hf
+from wd_tagger_append.loss import AsymmetricLossMultiLabel
 from wd_tagger_append.metrics import DEFAULT_THRESHOLD, create_compute_metrics_fn
 
 if TYPE_CHECKING:
@@ -398,32 +399,6 @@ def main(
         float,
         typer.Option("--metrics-threshold", min=0.0, max=1.0),
     ] = DEFAULT_THRESHOLD,
-    metrics_top_k: Annotated[
-        list[int],
-        typer.Option(
-            "--metrics-top-k",
-            help=(
-                "Emit ranking metrics at the provided cut-offs "
-                "(use multiple times for several values)."
-            ),
-        ),
-    ] = [2],  # noqa: B006
-    metrics_propensity_a: Annotated[
-        float,
-        typer.Option(
-            "--metrics-propensity-a",
-            min=0.0,
-            help="Propensity hyper-parameter 'a' for XMLC diagnostics.",
-        ),
-    ] = 0.55,
-    metrics_propensity_b: Annotated[
-        float,
-        typer.Option(
-            "--metrics-propensity-b",
-            min=0.0,
-            help="Propensity hyper-parameter 'b' for XMLC diagnostics.",
-        ),
-    ] = 1.5,
     logging_steps: Annotated[
         int,
         typer.Option("--logging-steps", min=1),
@@ -554,9 +529,6 @@ def main(
     """Run LoRA fine-tuning."""
     _validate_dataset_inputs(dataset_path, dataset_name)
 
-    if any(value <= 0 for value in metrics_top_k):
-        _raise_bad_parameter("--metrics-top-k values must be positive integers.")  # pyright: ignore[reportGeneralTypeIssues]
-
     repo_id = MODEL_REPO_MAP.get(model_key.lower())
     if repo_id is None:
         typer.echo(
@@ -639,14 +611,6 @@ def main(
     typer.echo(f"Final label space: {len(label_list)} tags")
 
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    top_k_values: tuple[int, ...] = tuple(sorted(set(metrics_top_k)))
-    if top_k_values and top_k_values[-1] > len(label_list):
-        msg = (
-            "Maximum --metrics-top-k value exceeds number of labels ("
-            f"{top_k_values[-1]} > {len(label_list)})."
-        )
-        _raise_bad_parameter(msg)  # pyright: ignore[reportGeneralTypeIssues]
 
     # Save labels as CSV (WD Tagger v3 compatible format)
     csv_path = output_dir / "selected_tags.csv"
@@ -745,18 +709,9 @@ def main(
 
     data_collator = _create_data_collator(num_labels=len(label_list), mixup_alpha=mixup_alpha)
 
-    label_frequencies_vector: list[int] | None = None
-    if top_k_values:
-        label_frequencies_vector = [int(tag_frequencies.get(tag, 0)) for tag in label_list]
-
     compute_metrics = create_compute_metrics_fn(
         num_labels=len(label_list),
         threshold=metrics_threshold,
-        top_k=top_k_values,
-        label_frequencies=label_frequencies_vector,
-        dataset_size=len(combined),
-        propensity_a=metrics_propensity_a,
-        propensity_b=metrics_propensity_b,
     )
 
     trainer_eval_strategy = "no" if eval_dataset is None else eval_strategy
@@ -816,6 +771,7 @@ def main(
         "eval_dataset": eval_dataset,
         "data_collator": data_collator,
         "compute_metrics": compute_metrics if eval_dataset is not None else None,
+        "compute_loss_func": AsymmetricLossMultiLabel(),
         "processing_class": image_processor,
     }
     trainer = Trainer(**trainer_kwargs)
