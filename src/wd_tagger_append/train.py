@@ -571,16 +571,7 @@ def main(
     ] = True,
 ) -> None:
     """Run LoRA fine-tuning."""
-    # Initialize mutable default arguments
-    if metrics_top_k is None:
-        metrics_top_k = []
-
     _validate_dataset_inputs(dataset_path, dataset_name)
-
-    if not metrics_top_k:
-        _raise_bad_parameter(
-            "--metrics-propensity requires at least one --metrics-top-k value.",
-        )  # pyright: ignore[reportGeneralTypeIssues]
 
     if any(value <= 0 for value in metrics_top_k):
         _raise_bad_parameter("--metrics-top-k values must be positive integers.")  # pyright: ignore[reportGeneralTypeIssues]
