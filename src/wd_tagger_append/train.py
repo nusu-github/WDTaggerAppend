@@ -429,6 +429,39 @@ def main(
         float,
         typer.Option("--metrics-threshold", min=0.0, max=1.0),
     ] = DEFAULT_THRESHOLD,
+    metrics_top_k: Annotated[
+        list[int] | None,
+        typer.Option(
+            "--metrics-top-k",
+            help=(
+                "Emit ranking metrics at the provided cut-offs "
+                "(use multiple times for several values)."
+            ),
+        ),
+    ] = None,
+    metrics_propensity: Annotated[
+        bool,
+        typer.Option(
+            "--metrics-propensity",
+            help="Enable propensity-scored nDCG@k using dataset tag frequencies.",
+        ),
+    ] = False,
+    metrics_propensity_a: Annotated[
+        float,
+        typer.Option(
+            "--metrics-propensity-a",
+            min=0.0,
+            help="Propensity hyper-parameter 'a' for XMLC diagnostics.",
+        ),
+    ] = 0.55,
+    metrics_propensity_b: Annotated[
+        float,
+        typer.Option(
+            "--metrics-propensity-b",
+            min=0.0,
+            help="Propensity hyper-parameter 'b' for XMLC diagnostics.",
+        ),
+    ] = 1.5,
     logging_steps: Annotated[
         int,
         typer.Option("--logging-steps", min=1),
@@ -481,7 +514,19 @@ def main(
     ] = True,
 ) -> None:
     """Run LoRA fine-tuning."""
+    # Initialize mutable default arguments
+    if metrics_top_k is None:
+        metrics_top_k = []
+
     _validate_dataset_inputs(dataset_path, dataset_name)
+
+    if metrics_propensity and not metrics_top_k:
+        _raise_bad_parameter(
+            "--metrics-propensity requires at least one --metrics-top-k value.",
+        )  # pyright: ignore[reportGeneralTypeIssues]
+
+    if any(value <= 0 for value in metrics_top_k):
+        _raise_bad_parameter("--metrics-top-k values must be positive integers.")  # pyright: ignore[reportGeneralTypeIssues]
 
     repo_id = MODEL_REPO_MAP.get(model_key.lower())
     if repo_id is None:
@@ -565,6 +610,14 @@ def main(
     typer.echo(f"Final label space: {len(label_list)} tags")
 
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    top_k_values: tuple[int, ...] = tuple(sorted(set(metrics_top_k)))
+    if top_k_values and top_k_values[-1] > len(label_list):
+        msg = (
+            "Maximum --metrics-top-k value exceeds number of labels ("
+            f"{top_k_values[-1]} > {len(label_list)})."
+        )
+        _raise_bad_parameter(msg)  # pyright: ignore[reportGeneralTypeIssues]
 
     # Save labels as CSV (WD Tagger v3 compatible format)
     csv_path = output_dir / "selected_tags.csv"
@@ -674,9 +727,20 @@ def main(
     model.print_trainable_parameters()
 
     data_collator = _create_data_collator(num_labels=len(label_list), mixup_alpha=mixup_alpha)
+
+    label_frequencies_vector: list[int] | None = None
+    if top_k_values:
+        label_frequencies_vector = [int(tag_frequencies.get(tag, 0)) for tag in label_list]
+
     compute_metrics = create_compute_metrics_fn(
         num_labels=len(label_list),
         threshold=metrics_threshold,
+        top_k=top_k_values,
+        label_frequencies=label_frequencies_vector,
+        dataset_size=len(combined) if metrics_propensity else None,
+        propensity_a=metrics_propensity_a,
+        propensity_b=metrics_propensity_b,
+        enable_propensity=metrics_propensity,
     )
 
     trainer_eval_strategy = "no" if eval_dataset is None else eval_strategy
@@ -705,7 +769,7 @@ def main(
         "hub_private_repo": private,
         "gradient_checkpointing": gradient_checkpointing,
         "load_best_model_at_end": eval_dataset is not None,
-        "metric_for_best_model": "f1",
+        "metric_for_best_model": "auroc",
         "greater_is_better": True,
     }
     training_args = TrainingArguments(**training_args_kwargs)

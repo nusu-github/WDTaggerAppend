@@ -352,7 +352,7 @@ def main(
             revision=adapter_revision,
             token=adapter_token_final,
         )
-        adapter_base = cast(str, peft_config.base_model_name_or_path)
+        adapter_base = cast("str", peft_config.base_model_name_or_path)
         if repo_id is None and model in MODEL_REPO_MAP:
             base_identifier = adapter_base
         typer.echo(

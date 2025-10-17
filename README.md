@@ -72,6 +72,8 @@ Important knobs:
 - `--lora-rank`, `--lora-alpha`, `--lora-dropout`: PEFT LoRA hyperparameters.
 - `--mixup-alpha`: Enable torchvision MixUp during batching.
 - `--load-in-4bit` / `--load-in-8bit`: Activate BitsAndBytes quantised loading; works with `--precision` (`fp32`, `bf16`, `fp16`).
+- `--metrics-top-k`: Report Precision@K / Recall@K / nDCG@K for chosen cut-offs (repeat to add values).
+- `--metrics-propensity`: Add propensity-scored nDCG@K using dataset tag frequencies (requires `--metrics-top-k`).
 - `--push-to-hub`, `--hub-model-id`, `--hub-token`: Push adapters automatically after training.
 
 The trainer writes checkpoints plus a `label_mapping.json` (merged base + dataset tags) to `output-dir`.
