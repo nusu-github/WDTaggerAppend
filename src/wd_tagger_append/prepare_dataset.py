@@ -7,16 +7,16 @@ into Hugging Face Datasets format with MD5-based deduplication.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import TYPE_CHECKING, Annotated
 
 import typer
 from PIL import Image as PILImage
 
-from datasets import Dataset, DatasetDict, Features, Image, Sequence, Value
+from datasets import ClassLabel, Dataset, DatasetDict, Features, Image, Sequence, Value
 
 if TYPE_CHECKING:
     from collections.abc import Generator
-    from pathlib import Path
 
 app = typer.Typer(help="Prepare WD Tagger datasets from image folders")
 
@@ -42,13 +42,10 @@ def get_dataset_features() -> Features:
             "source": Value("string"),
             "image": Image(),
             "tags": {
+                "rating": ClassLabel(names=list(RATING_MAP.values())),
                 "general": Sequence(Value("string")),
                 "character": Sequence(Value("string")),
-                "copyright": Sequence(Value("string")),
-                "artist": Sequence(Value("string")),
-                "meta": Sequence(Value("string")),
             },
-            "rating": Value("string"),
             "score": Value("int32"),
         },
     )
@@ -118,15 +115,12 @@ def parse_danbooru_json(json_path: Path) -> dict:
     # Extract tag strings with fallback to empty string
     return {
         "md5": data["md5"],
-        "rating": data["rating"],
         "score": data.get("score", 0),
         "source": data.get("source", ""),
         "tags": {
+            "rating": data["rating"],
             "general": data.get("tag_string_general", "").split(),
             "character": data.get("tag_string_character", "").split(),
-            "copyright": data.get("tag_string_copyright", "").split(),
-            "artist": data.get("tag_string_artist", "").split(),
-            "meta": data.get("tag_string_meta", "").split(),
         },
     }
 
@@ -285,7 +279,7 @@ def prepare(
             "--private",
             help="Make the Hub repository private",
         ),
-    ] = False,
+    ] = True,
 ) -> None:
     """Prepare WD Tagger dataset from image folder with Danbooru JSON metadata.
 

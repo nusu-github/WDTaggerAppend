@@ -6,9 +6,9 @@ and integration with training pipelines.
 
 from __future__ import annotations
 
-import json
 from typing import TYPE_CHECKING
 
+import pandas as pd
 import torch
 
 if TYPE_CHECKING:
@@ -16,6 +16,14 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from datasets import Dataset
+
+
+# WD Tagger category codes (matching original selected_tags.csv format)
+CATEGORY_MAP = {
+    "rating": 9,
+    "general": 0,
+    "character": 4,
+}
 
 
 def create_label_mapping(dataset: Dataset) -> dict[str, int]:
@@ -29,10 +37,10 @@ def create_label_mapping(dataset: Dataset) -> dict[str, int]:
     """
     all_tags = set()
 
-    # Collect all unique tags from all categories
+    # Collect all unique tags from relevant categories only
     for example in dataset:
-        tags_dict = example["tags"]
-        for category in ["general", "character", "copyright", "artist", "meta"]:
+        tags_dict = example["tags"]  # type: ignore[index]
+        for category in ["general", "character"]:
             all_tags.update(tags_dict[category])
 
     # Create sorted mapping for reproducibility
@@ -40,36 +48,41 @@ def create_label_mapping(dataset: Dataset) -> dict[str, int]:
     return {tag: idx for idx, tag in enumerate(sorted_tags)}
 
 
-def save_label_mapping(label_mapping: dict[str, int], output_path: Path) -> None:
-    """Save label mapping to a JSON file.
+def save_labels_as_csv(
+    label_list: list[str],
+    tag_categories: dict[str, list[str]],
+    output_path: Path,
+) -> None:
+    """Save labels in WD Tagger v3 compatible CSV format (selected_tags.csv).
 
     Args:
-        label_mapping: Dictionary mapping tags to indices.
-        output_path: Path to save the JSON file.
+        label_list: Ordered list of all label names.
+        tag_categories: Dictionary mapping category names to lists of tags in that category.
+                       Expected keys: 'rating', 'general', 'character'
+        output_path: Path to save the CSV file.
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", encoding="utf-8") as f:
-        json.dump(label_mapping, f, indent=2, ensure_ascii=False)
 
+    # Build category lookup
+    tag_to_category: dict[str, int] = {}
+    for category_name, tags in tag_categories.items():
+        category_code = CATEGORY_MAP.get(category_name)
+        if category_code is None:
+            continue
+        for tag in tags:
+            tag_to_category[tag] = category_code
 
-def load_label_mapping(mapping_path: Path) -> dict[str, int]:
-    """Load label mapping from a JSON file.
+    # Write CSV
+    df = pd.DataFrame(
+        {
+            "tag_id": list(range(len(label_list))),
+            "name": label_list,
+            "category": [tag_to_category.get(tag, CATEGORY_MAP["general"]) for tag in label_list],
+            "count": [0] * len(label_list),  # Placeholder; not computed from dataset
+        }
+    )
 
-    Args:
-        mapping_path: Path to the JSON file containing the mapping.
-
-    Returns:
-        Dictionary mapping tag strings to integer indices.
-
-    Raises:
-        FileNotFoundError: If the mapping file doesn't exist.
-    """
-    if not mapping_path.exists():
-        msg = f"Label mapping file not found: {mapping_path}"
-        raise FileNotFoundError(msg)
-
-    with mapping_path.open("r", encoding="utf-8") as f:
-        return json.load(f)
+    df.to_csv(output_path, index=False)
 
 
 def encode_multi_labels(
@@ -88,9 +101,9 @@ def encode_multi_labels(
     num_classes = len(label_mapping)
     labels = torch.zeros(num_classes, dtype=torch.float32)
 
-    # Collect all tags from all categories
+    # Collect all tags from relevant categories only
     all_tags = []
-    for category in ["general", "character", "copyright", "artist", "meta"]:
+    for category in ["general", "character"]:
         all_tags.extend(tags_dict.get(category, []))
 
     # Set corresponding indices to 1
@@ -151,19 +164,19 @@ def get_dataset_statistics(dataset: Dataset) -> dict:
     """
     stats = {
         "num_examples": len(dataset),
-        "tag_counts": {"general": 0, "character": 0, "copyright": 0, "artist": 0, "meta": 0},
+        "tag_counts": {"general": 0, "character": 0},
         "rating_distribution": {},
     }
 
     # Collect statistics
     for example in dataset:
         # Count tags per category
-        tags_dict = example["tags"]
+        tags_dict = example["tags"]  # type: ignore[index]
         for category in stats["tag_counts"]:
             stats["tag_counts"][category] += len(tags_dict[category])
 
         # Count ratings
-        rating = example["rating"]
+        rating = example["rating"]  # type: ignore[index]
         stats["rating_distribution"][rating] = stats["rating_distribution"].get(rating, 0) + 1
 
     return stats

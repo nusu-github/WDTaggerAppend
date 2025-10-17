@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal, NoReturn, cast
 import torch
 import typer
 from huggingface_hub.errors import HfHubHTTPError
-from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from torch import Tensor, nn
 from transformers import (
     AutoImageProcessor,
@@ -31,7 +31,7 @@ from wd_tagger_append.augmentation import (
 from wd_tagger_append.dataset_utils import (
     create_label_mapping,
     create_transform_function,
-    save_label_mapping,
+    save_labels_as_csv,
 )
 from wd_tagger_append.infer import MODEL_REPO_MAP, load_labels_hf
 from wd_tagger_append.metrics import DEFAULT_THRESHOLD, create_compute_metrics_fn
@@ -398,10 +398,10 @@ def main(
         int,
         typer.Option("--save-total-limit", min=1),
     ] = 2,
-    evaluation_strategy: Annotated[
+    eval_strategy: Annotated[
         Literal["no", "steps", "epoch"],
         typer.Option(
-            "--evaluation-strategy",
+            "--eval-strategy",
             help="Evaluation strategy for Trainer.",
         ),
     ] = "epoch",
@@ -429,6 +429,10 @@ def main(
         str | None,
         typer.Option("--hub-token", help="Token for private Hub repos or datasets."),
     ] = None,
+    private: Annotated[
+        bool,
+        typer.Option("--private", help="Make the Hub repository private when pushing."),
+    ] = True,
 ) -> None:
     """Run LoRA fine-tuning."""
     _validate_dataset_inputs(dataset_path, dataset_name)
@@ -457,7 +461,8 @@ def main(
         combined = splits.train
 
     dataset_label_mapping = create_label_mapping(combined)
-    base_labels = load_labels_hf(repo_id=repo_id, revision=base_revision, token=hub_token).names
+    base_label_data = load_labels_hf(repo_id=repo_id, revision=base_revision, token=hub_token)
+    base_labels = base_label_data.names
     label_list = _merge_label_lists(base_labels, dataset_label_mapping.keys())
     label2id = {label: idx for idx, label in enumerate(label_list)}
     id2label = {idx: label for label, idx in label2id.items()}
@@ -466,9 +471,39 @@ def main(
     typer.echo(f"Final label space: {len(label_list)} tags")
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    label_path = output_dir / "label_mapping.json"
-    save_label_mapping(label2id, label_path)
-    typer.echo(f"Saved label mapping to {label_path}")
+
+    # Save labels as CSV (WD Tagger v3 compatible format)
+    csv_path = output_dir / "selected_tags.csv"
+
+    # Build category mapping
+    base_general_tags = {base_labels[idx] for idx in base_label_data.general}
+    base_character_tags = {base_labels[idx] for idx in base_label_data.character}
+    base_rating_tags = {base_labels[idx] for idx in base_label_data.rating}
+
+    # Categorize all labels
+    general_tags = []
+    character_tags = []
+    rating_tags = []
+
+    for tag in label_list:
+        if tag in base_rating_tags:
+            rating_tags.append(tag)
+        elif tag in base_character_tags:
+            character_tags.append(tag)
+        elif tag in base_general_tags:
+            general_tags.append(tag)
+        else:
+            # New tags from dataset default to general category
+            general_tags.append(tag)
+
+    tag_categories = {
+        "rating": rating_tags,
+        "general": general_tags,
+        "character": character_tags,
+    }
+
+    save_labels_as_csv(label_list, tag_categories, csv_path)
+    typer.echo(f"Saved labels as CSV to {csv_path}")
 
     train_transform = create_train_transform(
         pretrained_model_name_or_path=repo_id,
@@ -492,7 +527,7 @@ def main(
         revision=base_revision,
         device_map="auto" if quant_config is not None else None,
         quantization_config=quant_config,
-        torch_dtype=precision_dtype,
+        dtype=precision_dtype,
     )
     image_processor = AutoImageProcessor.from_pretrained(repo_id, revision=base_revision)
 
@@ -525,7 +560,6 @@ def main(
         lora_alpha=lora_alpha,
         lora_dropout=lora_dropout,
         target_modules="all-linear",
-        task_type=TaskType.SEQ_CLS,
         modules_to_save=sorted(modules_to_save),
         bias="none",
     )
@@ -538,7 +572,7 @@ def main(
         threshold=metrics_threshold,
     )
 
-    trainer_eval_strategy = "no" if eval_dataset is None else evaluation_strategy
+    trainer_eval_strategy = "no" if eval_dataset is None else eval_strategy
 
     training_args_kwargs: dict[str, Any] = {
         "output_dir": str(output_dir),
@@ -550,7 +584,7 @@ def main(
         "weight_decay": weight_decay,
         "warmup_ratio": warmup_ratio,
         "logging_steps": logging_steps,
-        "evaluation_strategy": trainer_eval_strategy,
+        "eval_strategy": trainer_eval_strategy,
         "save_strategy": save_strategy,
         "save_total_limit": save_total_limit,
         "bf16": bf16,
@@ -561,6 +595,7 @@ def main(
         "push_to_hub": push_to_hub,
         "hub_model_id": hub_model_id,
         "hub_token": hub_token,
+        "hub_private_repo": private,
         "gradient_checkpointing": gradient_checkpointing,
         "load_best_model_at_end": eval_dataset is not None,
         "metric_for_best_model": "f1",

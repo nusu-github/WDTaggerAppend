@@ -4,7 +4,12 @@ This module provides metric computation functions compatible with Hugging Face T
 Based on the original JAX-CV implementation which uses:
 - F1 Score (macro-averaged, threshold=0.4)
 - Matthews Correlation Coefficient (macro-averaged, threshold=0.4)
+- Precision (micro-averaged, threshold=0.4) - for reference only
+- Recall (micro-averaged, threshold=0.4) - for reference only
 - Binary Cross Entropy Loss (with sigmoid)
+
+Note: The original JAX-CV training loop only tracks F1 and MCC.
+Precision and Recall are included here for additional monitoring.
 """
 
 from __future__ import annotations
@@ -31,6 +36,12 @@ def create_compute_metrics_fn(
 ) -> Callable[[EvalPrediction], dict[str, float]]:
     """Create a compute_metrics function for use with Hugging Face Trainer.
 
+    Matches the JAX-CV implementation:
+    - F1: macro-averaged (average across labels)
+    - MCC: macro-averaged (average across labels)
+    - Precision: micro-averaged (global TP/FP across all samples and labels)
+    - Recall: micro-averaged (global TP/FN across all samples and labels)
+
     Args:
         num_labels: Total number of labels in the model
         threshold: Probability threshold for binary classification (default: 0.4)
@@ -46,34 +57,44 @@ def create_compute_metrics_fn(
         ...     ...
         ... )
     """
-    # Initialize metrics with proper configuration
+    # Initialize metrics matching JAX-CV configuration
     f1_metric = F1Score(
         task="multilabel",
         num_labels=num_labels,
-        average="macro",
+        average="macro",  # JAX-CV: macro averaging
         threshold=threshold,
     )
     mcc_metric = MatthewsCorrCoef(
         task="multilabel",
         num_labels=num_labels,
-        threshold=threshold,
+        threshold=threshold,  # JAX-CV: macro averaging (torchmetrics default for multilabel)
     )
     precision_metric = Precision(
         task="multilabel",
         num_labels=num_labels,
-        average="macro",
+        average="micro",  # JAX-CV: micro averaging (changed from macro)
         threshold=threshold,
     )
     recall_metric = Recall(
         task="multilabel",
         num_labels=num_labels,
-        average="macro",
+        average="micro",  # JAX-CV: micro averaging (changed from macro)
         threshold=threshold,
     )
     bce_metric = BCEWithLogitsLoss()
 
     def compute_metrics(eval_pred: EvalPrediction) -> dict[str, float]:
         """Compute metrics from model predictions.
+
+        Follows JAX-CV behavior:
+        1. Sigmoid is applied to logits (from_logits=True in JAX-CV)
+        2. Probabilities are compared against threshold for binary predictions
+        3. Labels are compared against threshold (for soft label support)
+        4. Metrics are computed on the binarized predictions and labels
+
+        Note: Currently labels are hard (0 or 1), so label > threshold
+        is equivalent to label == 1. This preserves compatibility if
+        soft labels are introduced in the future.
 
         Args:
             eval_pred: Predictions and labels from evaluation
@@ -88,14 +109,23 @@ def create_compute_metrics_fn(
         logits_tensor = torch.from_numpy(logits)
         labels_tensor = torch.from_numpy(labels)
 
-        # Apply sigmoid to logits to get probabilities
+        # Apply sigmoid to logits to get probabilities (JAX-CV: from_logits=True)
         probs = torch.sigmoid(logits_tensor)
 
-        # Compute metrics
-        f1_score = f1_metric(probs, labels_tensor.int())
-        mcc_score = mcc_metric(probs, labels_tensor.int())
-        precision_score = precision_metric(probs, labels_tensor.int())
-        recall_score = recall_metric(probs, labels_tensor.int())
+        # JAX-CV applies threshold to BOTH predictions and labels
+        # This supports soft labels (continuous values 0.0-1.0)
+        # For hard labels (0 or 1), labels > threshold is effectively labels == 1
+        # See ConfusionMatrix.py: labels = labels > threshold
+        binary_preds = (probs > threshold).int()
+        binary_labels = (labels_tensor > threshold).int()
+
+        # Compute metrics on binarized predictions and labels
+        f1_score = f1_metric(binary_preds, binary_labels)
+        mcc_score = mcc_metric(binary_preds, binary_labels)
+        precision_score = precision_metric(binary_preds, binary_labels)
+        recall_score = recall_metric(binary_preds, binary_labels)
+
+        # BCE uses raw logits and labels (no thresholding)
         bce_score = bce_metric(logits_tensor, labels_tensor.float())
 
         return {

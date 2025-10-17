@@ -20,7 +20,6 @@ from transformers import (
 )
 
 from wd_tagger_append.augmentation import create_eval_transform
-from wd_tagger_append.dataset_utils import load_label_mapping
 
 app = typer.Typer(help="WD Tagger v3 inference with timm")
 
@@ -39,9 +38,6 @@ class LabelData:
     rating: list[np.int64]
     general: list[np.int64]
     character: list[np.int64]
-
-
-LABEL_MAPPING_FILENAME = "label_mapping.json"
 
 
 def _load_labels_from_csv(csv_path: Path) -> LabelData:
@@ -109,67 +105,17 @@ def _parse_precision(precision: str | None) -> torch.dtype | None:
     raise typer.BadParameter(msg)
 
 
-def _build_label_data_from_mapping(
-    mapping: dict[str, int],
-    base_labels: LabelData,
-) -> LabelData:
-    """Create LabelData from a tag->index mapping, using base categories as hints."""
-    num_labels = len(mapping)
-    names: list[str | None] = [None] * num_labels
-    for tag, index in mapping.items():
-        if index < 0 or index >= num_labels:
-            msg = f"Invalid label index {index} for tag '{tag}' in mapping."
-            raise typer.BadParameter(msg)
-        names[index] = tag
-
-    missing = [idx for idx, name in enumerate(names) if name is None]
-    if missing:
-        msg = "Label mapping is incomplete; missing labels for indices: " + ", ".join(
-            str(idx) for idx in missing
-        )
-        raise typer.BadParameter(msg)
-
-    # Build lookup tables from the base label metadata to infer categories.
-    base_general = {base_labels.names[idx] for idx in base_labels.general}
-    base_character = {base_labels.names[idx] for idx in base_labels.character}
-    base_rating = {base_labels.names[idx] for idx in base_labels.rating}
-
-    rating: list[np.int64] = []
-    general: list[np.int64] = []
-    character: list[np.int64] = []
-
-    for idx, tag in enumerate(names):
-        assert tag is not None
-        if tag in base_rating:
-            rating.append(np.int64(idx))
-        if tag in base_character:
-            character.append(np.int64(idx))
-        if tag in base_general or tag in base_character or tag in base_rating:
-            if tag in base_general:
-                general.append(np.int64(idx))
-        else:
-            # Default new labels to the general category.
-            general.append(np.int64(idx))
-
-    return LabelData(
-        names=[str(name) for name in names],
-        rating=rating,
-        general=general,
-        character=character,
-    )
-
-
-def _load_label_mapping_from_source(
+def _load_csv_from_source(
     source: str | None,
     adapter: str | None,
     adapter_revision: str | None,
     adapter_token: str | None,
 ) -> Path | None:
-    """Locate a label mapping JSON file from CLI options or adapter repo."""
+    """Locate a selected_tags.csv file from CLI options or adapter repo."""
     if source is not None:
         path = Path(source).expanduser()
         if not path.exists():
-            msg = f"Label mapping file not found: {source}"
+            msg = f"Label file not found: {source}"
             raise typer.BadParameter(msg)
         return path
 
@@ -178,7 +124,7 @@ def _load_label_mapping_from_source(
 
     # Try to resolve local adapter first.
     if _is_local_path(adapter):
-        candidate = Path(adapter) / LABEL_MAPPING_FILENAME
+        candidate = Path(adapter) / "selected_tags.csv"
         if candidate.exists():
             return candidate
         return None
@@ -186,7 +132,7 @@ def _load_label_mapping_from_source(
     try:
         downloaded = hf_hub_download(
             repo_id=adapter,
-            filename=LABEL_MAPPING_FILENAME,
+            filename="selected_tags.csv",
             revision=adapter_revision,
             token=adapter_token,
         )
@@ -230,18 +176,17 @@ def _load_label_data(
     else:
         base_labels = load_labels_hf(repo_id=base_repo, revision=revision, token=token)
 
-    mapping_path = _load_label_mapping_from_source(
+    csv_path = _load_csv_from_source(
         str(labels_path) if labels_path is not None else None,
         adapter=adapter,
         adapter_revision=adapter_revision,
         adapter_token=adapter_token,
     )
-    if mapping_path is None:
+    if csv_path is None:
         return base_labels
 
-    typer.echo(f"Loading label mapping from {mapping_path}...")
-    mapping = load_label_mapping(mapping_path)
-    return _build_label_data_from_mapping(mapping, base_labels)
+    typer.echo(f"Loading labels from {csv_path}...")
+    return _load_labels_from_csv(csv_path)
 
 
 def load_labels_hf(
