@@ -35,7 +35,7 @@ dependencies = [
   "bitsandbytes>=0.48.1",
   "datasets[vision]>=4.2.0",
   "evaluate>=0.4.6",
-  "huggingface-hub>=0.35.3",
+  "huggingface-hub[hf_xet,hf_transfer]>=0.35.3",
   "numpy>=2.2.6",
   "pandas>=2.3.3",
   "peft>=0.17.1",
@@ -72,9 +72,7 @@ wd-tagger-infer = "wd_tagger_append.infer:app"
 wd-tagger-train = "wd_tagger_append.train:app"
 
 [project.optional-dependencies]
-schedulefree = [
-    "schedulefree>=1.4.1",
-]
+schedulefree = ["schedulefree>=1.4.1"]
 
 [dependency-groups]
 dev = ["pyright>=1.1.405", "pytest>=8.4.2", "ruff>=0.13.0"]
