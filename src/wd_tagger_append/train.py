@@ -9,7 +9,8 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal, NoReturn, cast
 import torch
 import typer
 from huggingface_hub.errors import HfHubHTTPError
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, PeftModel, get_peft_model
+from peft.utils import ModulesToSaveWrapper
 from torch import Tensor, nn
 from transformers import (
     AutoImageProcessor,
@@ -171,6 +172,26 @@ def _resolve_classifier_module(model: AutoModelForImageClassification) -> tuple[
     raise ValueError(msg)
 
 
+def _resolve_peft_module(model: PeftModel) -> tuple[nn.Linear, str]:
+    """Return classifier module and its dotted path from a PEFT model."""
+    head = model.base_model.model.timm_model.head  # type: ignore[union-attr]
+    base_path = "base_model.model.timm_model.head"
+
+    if isinstance(head, ModulesToSaveWrapper):
+        if isinstance(head.modules_to_save, nn.ModuleDict):
+            default_module = head.modules_to_save["default"]
+            if isinstance(default_module, nn.Linear):
+                return cast("nn.Linear", default_module), f"{base_path}.modules_to_save.default"
+            msg = (
+                f"PEFT classifier modules_to_save['default'] is not Linear: {type(default_module)}"
+            )
+            raise ValueError(msg)
+        msg = f"PEFT classifier modules_to_save is not ModuleDict: {type(head.modules_to_save)}"
+        raise ValueError(msg)
+    msg = f"PEFT classifier head is not ModulesToSaveWrapper: {type(head)}"
+    raise ValueError(msg)
+
+
 def _expand_classification_head(
     model: AutoModelForImageClassification,
     base_labels: Sequence[str],
@@ -231,6 +252,28 @@ def _parse_precision(precision: str | None) -> tuple[bool, bool, torch.dtype | N
     _raise_bad_parameter(msg)  # pyright: ignore[reportGeneralTypeIssues]
 
 
+def _create_gradient_mask_hook(num_base_labels: int) -> Callable[[Tensor], Tensor]:
+    """Create a gradient hook that zeros out gradients for base model labels.
+
+    This hook preserves base model performance when fine-tuning on domain-specific
+    data with few new labels by preventing updates to the existing label weights.
+
+    Args:
+        num_base_labels: Number of base model labels to freeze
+
+    Returns:
+        Hook function that masks gradients for the first num_base_labels indices
+    """
+
+    def gradient_mask_hook(grad: Tensor) -> Tensor:
+        """Zero out gradients for base model labels."""
+        masked_grad = grad.clone()
+        masked_grad[:num_base_labels] = 0
+        return masked_grad
+
+    return gradient_mask_hook
+
+
 def _create_data_collator(num_labels: int, mixup_alpha: float) -> Callable:
     """Create data collator for Trainer."""
     if mixup_alpha > 0:
@@ -274,35 +317,49 @@ def main(
         typer.Option(
             "--min-tag-count",
             min=1,
-            help="Minimum occurrence count required for dataset tags.",
+            help=(
+                "Minimum occurrence count required for NEW dataset tags. "
+                "Base model tags are always retained."
+            ),
         ),
     ] = 1,
     rating: Annotated[
         bool,
         typer.Option(
             "--rating/--no-rating",
-            help="Include rating tags when building training labels.",
+            help=(
+                "Include NEW rating tags from dataset. Base model rating tags are always retained."
+            ),
         ),
     ] = True,
     general: Annotated[
         bool,
         typer.Option(
             "--general/--no-general",
-            help="Include general tags when building training labels.",
+            help=(
+                "Include NEW general tags from dataset. "
+                "Base model general tags are always retained."
+            ),
         ),
     ] = True,
     character: Annotated[
         bool,
         typer.Option(
             "--character/--no-character",
-            help="Include character tags when building training labels.",
+            help=(
+                "Include NEW character tags from dataset. "
+                "Base model character tags are always retained."
+            ),
         ),
     ] = True,
     allowed_tags_file: Annotated[
         Path | None,
         typer.Option(
             "--allowed-tags-file",
-            help="Optional newline-delimited file restricting tags used for training.",
+            help=(
+                "Optional newline-delimited file restricting NEW tags used for training. "
+                "Base model tags are always retained."
+            ),
             exists=True,
             file_okay=True,
             dir_okay=False,
@@ -395,6 +452,16 @@ def main(
         bool,
         typer.Option("--gradient-checkpointing/--no-gradient-checkpointing"),
     ] = True,
+    freeze_base_labels: Annotated[
+        bool,
+        typer.Option(
+            "--freeze-base-labels/--no-freeze-base-labels",
+            help=(
+                "Freeze base model labels during training "
+                "(useful for domain-specific fine-tuning with few new tags)."
+            ),
+        ),
+    ] = False,
     metrics_threshold: Annotated[
         float,
         typer.Option("--metrics-threshold", min=0.0, max=1.0),
@@ -552,17 +619,64 @@ def main(
     else:
         combined = splits.train
 
+    # Load base model labels first
+    base_label_data = load_labels_hf(repo_id=repo_id, revision=base_revision, token=hub_token)
+    base_labels = base_label_data.names
+    base_label_set = set(base_labels)
+
+    # Extract ALL tags from dataset (no category filtering yet)
+    all_categories = ("rating", "general", "character")
+    _dataset_label_mapping_all, tag_frequencies_all = create_label_mapping(
+        combined,
+        categories=all_categories,
+        min_count=1,  # No filtering yet
+        allowed_tags=None,
+    )
+
+    # Separate base tags from new tags
+    new_tags_frequencies = {
+        tag: count for tag, count in tag_frequencies_all.items() if tag not in base_label_set
+    }
+
+    typer.echo(
+        f"Dataset contains {len(tag_frequencies_all)} unique tags: "
+        f"{len(tag_frequencies_all) - len(new_tags_frequencies)} base model tags, "
+        f"{len(new_tags_frequencies)} new tags",
+    )
+
+    # Apply filters ONLY to new tags
     category_flags = {
         "rating": rating,
         "general": general,
         "character": character,
     }
-    category_order = ("rating", "general", "character")
-    selected_categories = [name for name in category_order if category_flags[name]]
-    if not selected_categories:
-        msg = "At least one tag category must remain enabled."
-        _raise_bad_parameter(msg)  # pyright: ignore[reportGeneralTypeIssues]
+    selected_categories = [name for name in all_categories if category_flags[name]]
 
+    # Determine categories for new tags only
+    dataset_tag_categories = determine_tag_categories(combined, categories=all_categories)
+
+    # Filter new tags by category
+    filtered_new_tags = {
+        tag: count
+        for tag, count in new_tags_frequencies.items()
+        if dataset_tag_categories.get(tag, "general") in selected_categories
+    }
+
+    typer.echo(
+        f"After category filter ({', '.join(selected_categories)}): "
+        f"{len(filtered_new_tags)} new tags remain",
+    )
+
+    # Apply min_tag_count filter to new tags
+    filtered_new_tags = {
+        tag: count for tag, count in filtered_new_tags.items() if count >= min_tag_count
+    }
+
+    typer.echo(
+        f"After min-count filter (>={min_tag_count}): {len(filtered_new_tags)} new tags remain",
+    )
+
+    # Apply allowed_tags_file filter to new tags
     allow_list: set[str] | None = None
     if allowed_tags_file is not None:
         allow_list = load_allowed_tags(allowed_tags_file)
@@ -572,38 +686,24 @@ def main(
             )
             _raise_bad_parameter(msg)  # pyright: ignore[reportGeneralTypeIssues]
 
-    dataset_label_mapping, tag_frequencies = create_label_mapping(
-        combined,
-        categories=selected_categories,
-        min_count=min_tag_count,
-        allowed_tags=allow_list,
-    )
-
-    if not dataset_label_mapping:
-        msg = "No dataset tags remain after applying filters."
-        if allow_list is not None:
-            msg += " Adjust --allowed-tags-file to match dataset tags."
-        if min_tag_count > 1:
-            msg += " Consider lowering --min-tag-count."
-        _raise_bad_parameter(msg)  # pyright: ignore[reportGeneralTypeIssues]
-
-    typer.echo("Active tag categories: " + ", ".join(selected_categories))
-    typer.echo(
-        "Dataset tag filter -> min-count "
-        f"{min_tag_count} | kept {len(dataset_label_mapping)} of {len(tag_frequencies)} tags",
-    )
-
-    if allow_list is not None:
-        retained = len(dataset_label_mapping)
-        missing = len(allow_list.difference(dataset_label_mapping.keys()))
+        filtered_new_tags = {
+            tag: count for tag, count in filtered_new_tags.items() if tag in allow_list
+        }
         typer.echo(
-            f"Allow list matched {retained} tags; {missing} from {allowed_tags_file} "
-            "were not present in the dataset.",
+            f"After allow-list filter: {len(filtered_new_tags)} new tags remain "
+            f"({len(allow_list) - len(filtered_new_tags)} tags from allow-list not found)",
         )
 
-    base_label_data = load_labels_hf(repo_id=repo_id, revision=base_revision, token=hub_token)
-    base_labels = base_label_data.names
-    label_list = _merge_label_lists(base_labels, dataset_label_mapping.keys())
+    # Combine base labels with filtered new tags
+    dataset_label_mapping = {**{tag: idx for idx, tag in enumerate(base_labels)}}
+    dataset_label_mapping.update(dict.fromkeys(filtered_new_tags.keys(), 0))
+
+    typer.echo(
+        f"Final training labels: {len(base_labels)} base tags + "
+        f"{len(filtered_new_tags)} new tags = {len(dataset_label_mapping)} total",
+    )
+
+    label_list = _merge_label_lists(base_labels, filtered_new_tags.keys())
     label2id = {label: idx for idx, label in enumerate(label_list)}
     id2label = {idx: label for label, idx in label2id.items()}
 
@@ -619,9 +719,6 @@ def main(
     base_general_tags = {base_labels[idx] for idx in base_label_data.general}
     base_character_tags = {base_labels[idx] for idx in base_label_data.character}
     base_rating_tags = {base_labels[idx] for idx in base_label_data.rating}
-
-    # Determine dataset tag categories
-    dataset_tag_categories = determine_tag_categories(combined, categories=selected_categories)
 
     # Categorize all labels
     general_tags = []
@@ -658,13 +755,13 @@ def main(
         pretrained_model_name_or_path=repo_id,
     )
     train_dataset = splits.train.with_transform(
-        _wrap_transform(train_transform, label2id, selected_categories),
+        _wrap_transform(train_transform, label2id, all_categories),
     )
     eval_dataset = None
     if splits.eval is not None:
         eval_transform = create_eval_transform(pretrained_model_name_or_path=repo_id)
         eval_dataset = splits.eval.with_transform(
-            _wrap_transform(eval_transform, label2id, selected_categories),
+            _wrap_transform(eval_transform, label2id, all_categories),
         )
 
     bf16, fp16, precision_dtype = _parse_precision(precision)
@@ -707,6 +804,27 @@ def main(
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
+    # Register gradient masking hooks if base labels should be frozen
+    if freeze_base_labels:
+        num_base_labels = len(base_labels)
+        num_new_labels = len(label_list) - num_base_labels
+        typer.echo(
+            f"Freezing {num_base_labels} base labels; training only {num_new_labels} new labels",
+        )
+
+        # Get the classifier head (works with both timm_model.head and timm_model.head.fc)
+        classifier, _ = _resolve_peft_module(model)  # pyright: ignore[reportArgumentType]
+
+        # Create and register hooks for weight and bias
+        weight_hook = _create_gradient_mask_hook(num_base_labels)
+        classifier.weight.register_hook(weight_hook)
+
+        if classifier.bias is not None:
+            bias_hook = _create_gradient_mask_hook(num_base_labels)
+            classifier.bias.register_hook(bias_hook)
+
+        typer.echo("Gradient masking hooks registered for base model labels")
+
     data_collator = _create_data_collator(num_labels=len(label_list), mixup_alpha=mixup_alpha)
 
     compute_metrics = create_compute_metrics_fn(
@@ -715,6 +833,7 @@ def main(
     )
 
     trainer_eval_strategy = "no" if eval_dataset is None else eval_strategy
+    load_best = eval_dataset is not None and eval_strategy != "no"
 
     training_args_kwargs: dict[str, Any] = {
         "output_dir": str(output_dir),
@@ -758,7 +877,7 @@ def main(
         "hub_token": hub_token,
         "hub_private_repo": private,
         "gradient_checkpointing": gradient_checkpointing,
-        "load_best_model_at_end": eval_dataset is not None,
+        "load_best_model_at_end": load_best,
         "metric_for_best_model": "auroc",
         "greater_is_better": True,
     }

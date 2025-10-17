@@ -18,6 +18,7 @@ from datasets import ClassLabel, Dataset, DatasetDict, Features, Image, Sequence
 if TYPE_CHECKING:
     from collections.abc import Generator
 
+
 app = typer.Typer(help="Prepare WD Tagger datasets from image folders")
 
 
