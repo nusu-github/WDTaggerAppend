@@ -804,6 +804,8 @@ def main(
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
+    model.config.task_type = "multi_label_classification" # pyright: ignore[reportArgumentType, reportAttributeAccessIssue]
+
     # Register gradient masking hooks if base labels should be frozen
     if freeze_base_labels:
         num_base_labels = len(base_labels)
