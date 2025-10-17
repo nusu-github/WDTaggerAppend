@@ -116,7 +116,6 @@ def create_compute_metrics_fn(
     dataset_size: int | None = None,
     propensity_a: float = 0.55,
     propensity_b: float = 1.5,
-    enable_propensity: bool = False,
 ) -> Callable[[EvalPrediction], dict[str, float]]:
     """Create a compute_metrics function for use with Hugging Face Trainer.
 
@@ -139,7 +138,6 @@ def create_compute_metrics_fn(
         dataset_size: Dataset size used to estimate propensities.
         propensity_a: Propensity hyper-parameter ``a``.
         propensity_b: Propensity hyper-parameter ``b``.
-        enable_propensity: Enable propensity-scored ranking metrics.
 
     Returns:
         Function that computes metrics from EvalPrediction
@@ -164,19 +162,18 @@ def create_compute_metrics_fn(
             raise ValueError(msg)
         top_k_values = tuple(unique_sorted)
 
-    if enable_propensity:
-        if label_frequencies is None:
-            msg = "label_frequencies must be provided when enable_propensity is True."
-            raise ValueError(msg)
-        if len(label_frequencies) != num_labels:
-            msg = "label_frequencies must match num_labels when computing propensities."
-            raise ValueError(msg)
-        if dataset_size is None:
-            msg = "dataset_size must be supplied when enable_propensity is True."
-            raise ValueError(msg)
+    if label_frequencies is None:
+        msg = "label_frequencies must be provided when enable_propensity is True."
+        raise ValueError(msg)
+    if len(label_frequencies) != num_labels:
+        msg = "label_frequencies must match num_labels when computing propensities."
+        raise ValueError(msg)
+    if dataset_size is None:
+        msg = "dataset_size must be supplied when enable_propensity is True."
+        raise ValueError(msg)
 
     propensity_tensor: torch.Tensor | None = None
-    if enable_propensity and label_frequencies is not None and dataset_size is not None:
+    if label_frequencies is not None and dataset_size is not None:
         propensity_tensor = compute_propensity_scores(
             label_frequencies,
             dataset_size,

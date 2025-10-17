@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal, NoReturn, cast
 import torch
 import typer
 from huggingface_hub.errors import HfHubHTTPError
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from peft import LoraConfig, get_peft_model
 from torch import Tensor, nn
 from transformers import (
     AutoImageProcessor,
@@ -406,14 +406,6 @@ def main(
         float,
         typer.Option("--mixup-alpha", min=0.0),
     ] = 0.0,
-    load_in_4bit: Annotated[
-        bool,
-        typer.Option("--load-in-4bit", help="Enable 4-bit quantized loading."),
-    ] = False,
-    load_in_8bit: Annotated[
-        bool,
-        typer.Option("--load-in-8bit", help="Enable 8-bit quantized loading."),
-    ] = False,
     precision: Annotated[
         str | None,
         typer.Option(
@@ -430,7 +422,7 @@ def main(
         typer.Option("--metrics-threshold", min=0.0, max=1.0),
     ] = DEFAULT_THRESHOLD,
     metrics_top_k: Annotated[
-        list[int] | None,
+        list[int],
         typer.Option(
             "--metrics-top-k",
             help=(
@@ -438,14 +430,7 @@ def main(
                 "(use multiple times for several values)."
             ),
         ),
-    ] = None,
-    metrics_propensity: Annotated[
-        bool,
-        typer.Option(
-            "--metrics-propensity",
-            help="Enable propensity-scored nDCG@k using dataset tag frequencies.",
-        ),
-    ] = False,
+    ] = [2],  # noqa: B006
     metrics_propensity_a: Annotated[
         float,
         typer.Option(
@@ -466,6 +451,18 @@ def main(
         int,
         typer.Option("--logging-steps", min=1),
     ] = 50,
+    logging_first_step: Annotated[
+        bool,
+        typer.Option("--logging-first-step/--no-logging-first-step"),
+    ] = False,
+    logging_nan_inf_filter: Annotated[
+        bool,
+        typer.Option("--logging-nan-inf-filter/--no-logging-nan-inf-filter"),
+    ] = True,
+    logging_strategy: Annotated[
+        Literal["no", "steps", "epoch"],
+        typer.Option("--logging-strategy"),
+    ] = "steps",
     save_strategy: Annotated[
         Literal["no", "steps", "epoch"],
         typer.Option(
@@ -484,6 +481,66 @@ def main(
             help="Evaluation strategy for Trainer.",
         ),
     ] = "epoch",
+    eval_accumulation_steps: Annotated[
+        int | None,
+        typer.Option("--eval-accumulation-steps", min=1),
+    ] = None,
+    torch_empty_cache_steps: Annotated[
+        int | None,
+        typer.Option("--torch-empty-cache-steps", min=1),
+    ] = None,
+    adam_beta1: Annotated[
+        float,
+        typer.Option("--adam-beta1", min=0.0, max=1.0),
+    ] = 0.9,
+    adam_beta2: Annotated[
+        float,
+        typer.Option("--adam-beta2", min=0.0, max=1.0),
+    ] = 0.999,
+    adam_epsilon: Annotated[
+        float,
+        typer.Option("--adam-epsilon", min=0.0),
+    ] = 1e-8,
+    max_grad_norm: Annotated[
+        float,
+        typer.Option("--max-grad-norm", min=0.0),
+    ] = 1.0,
+    max_steps: Annotated[
+        int,
+        typer.Option("--max-steps", min=-1),
+    ] = -1,
+    warmup_steps: Annotated[
+        int,
+        typer.Option("--warmup-steps", min=0),
+    ] = 0,
+    lr_scheduler_type: Annotated[
+        str,
+        typer.Option("--lr-scheduler-type"),
+    ] = "linear",
+    dataloader_drop_last: Annotated[
+        bool,
+        typer.Option("--dataloader-drop-last/--no-dataloader-drop-last"),
+    ] = False,
+    dataloader_num_workers: Annotated[
+        int,
+        typer.Option("--dataloader-num-workers", min=0),
+    ] = 0,
+    dataloader_pin_memory: Annotated[
+        bool,
+        typer.Option("--dataloader-pin-memory/--no-dataloader-pin-memory"),
+    ] = True,
+    dataloader_persistent_workers: Annotated[
+        bool,
+        typer.Option("--dataloader-persistent-workers/--no-dataloader-persistent-workers"),
+    ] = False,
+    label_smoothing_factor: Annotated[
+        float,
+        typer.Option("--label-smoothing-factor", min=0.0, max=1.0),
+    ] = 0.0,
+    optim: Annotated[
+        str,
+        typer.Option("--optim"),
+    ] = "adamw_torch",
     seed: Annotated[
         int,
         typer.Option("--seed"),
@@ -520,7 +577,7 @@ def main(
 
     _validate_dataset_inputs(dataset_path, dataset_name)
 
-    if metrics_propensity and not metrics_top_k:
+    if not metrics_top_k:
         _raise_bad_parameter(
             "--metrics-propensity requires at least one --metrics-top-k value.",
         )  # pyright: ignore[reportGeneralTypeIssues]
@@ -675,18 +732,12 @@ def main(
         )
 
     bf16, fp16, precision_dtype = _parse_precision(precision)
-    quant_config = _create_quantization_config(
-        load_in_4bit=load_in_4bit,
-        load_in_8bit=load_in_8bit,
-        compute_dtype=precision_dtype,
-    )
 
     typer.echo(f"Loading pretrained model: {repo_id}")
     model = AutoModelForImageClassification.from_pretrained(
         repo_id,
         revision=base_revision,
-        device_map="auto" if quant_config is not None else None,
-        quantization_config=quant_config,
+        device_map="auto",
         dtype=precision_dtype,
     )
     image_processor = AutoImageProcessor.from_pretrained(repo_id, revision=base_revision)
@@ -703,13 +754,7 @@ def main(
     model.config.problem_type = "multi_label_classification"
     model.config.use_cache = False
 
-    if quant_config is not None:
-        typer.echo("Preparing model for k-bit training.")
-        model = prepare_model_for_kbit_training(
-            model,
-            use_gradient_checkpointing=gradient_checkpointing,
-        )
-    elif gradient_checkpointing:
+    if gradient_checkpointing:
         model.gradient_checkpointing_enable()
 
     classifier_module_name = _resolve_classifier_module(model)[1]
@@ -737,10 +782,9 @@ def main(
         threshold=metrics_threshold,
         top_k=top_k_values,
         label_frequencies=label_frequencies_vector,
-        dataset_size=len(combined) if metrics_propensity else None,
+        dataset_size=len(combined),
         propensity_a=metrics_propensity_a,
         propensity_b=metrics_propensity_b,
-        enable_propensity=metrics_propensity,
     )
 
     trainer_eval_strategy = "no" if eval_dataset is None else eval_strategy
@@ -755,11 +799,29 @@ def main(
         "weight_decay": weight_decay,
         "warmup_ratio": warmup_ratio,
         "logging_steps": logging_steps,
+        "logging_first_step": logging_first_step,
+        "logging_nan_inf_filter": logging_nan_inf_filter,
+        "logging_strategy": logging_strategy,
         "eval_strategy": trainer_eval_strategy,
         "save_strategy": save_strategy,
         "save_total_limit": save_total_limit,
+        "eval_accumulation_steps": eval_accumulation_steps,
+        "torch_empty_cache_steps": torch_empty_cache_steps,
         "bf16": bf16,
         "fp16": fp16,
+        "adam_beta1": adam_beta1,
+        "adam_beta2": adam_beta2,
+        "adam_epsilon": adam_epsilon,
+        "max_grad_norm": max_grad_norm,
+        "max_steps": max_steps,
+        "warmup_steps": warmup_steps,
+        "lr_scheduler_type": lr_scheduler_type,
+        "dataloader_drop_last": dataloader_drop_last,
+        "dataloader_num_workers": dataloader_num_workers,
+        "dataloader_pin_memory": dataloader_pin_memory,
+        "dataloader_persistent_workers": dataloader_persistent_workers,
+        "label_smoothing_factor": label_smoothing_factor,
+        "optim": optim,
         "seed": seed,
         "remove_unused_columns": False,
         "report_to": report_to,
@@ -781,7 +843,7 @@ def main(
         "eval_dataset": eval_dataset,
         "data_collator": data_collator,
         "compute_metrics": compute_metrics if eval_dataset is not None else None,
-        "tokenizer": image_processor,
+        "processing_class": image_processor,
     }
     trainer = Trainer(**trainer_kwargs)
 
