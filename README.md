@@ -1,24 +1,20 @@
 # WD Tagger Append
 
-A comprehensive toolset for fine-tuning and deploying WD Tagger models for image tagging tasks. Built on top of the SmilingWolf WD Tagger family, this toolkit enables custom model training with LoRA adapters, dataset management, and streamlined inference.
+Tools for extending the SmilingWolf WD Tagger models with custom datasets, LoRA fine-tuning, and streamlined inference. The project embraces the Hugging Face ecosystem (datasets, transformers, peft, accelerate, bitsandbytes) to keep the training loop lightweight while matching the tagger family’s preprocessing and label handling.
 
 ## Features
 
-- **Dataset Preparation**: Upload local datasets to Hugging Face Hub with automatic validation
-- **Model Training**: Fine-tune WD Tagger models with LoRA adapters using local or Hub-hosted datasets
-- **Inference**: Tag images using pre-trained or custom-trained models
-- **Model Export**: Merge and upload trained adapters with custom processing code
-- **Tag Management**: Generate and upload extended tag CSV files for custom label sets
+- **Dataset preparation** – Scan Danbooru-style folders, deduplicate by MD5, split into train/validation, optionally save locally and push to the Hugging Face Hub.
+- **LoRA fine-tuning** – Train adapters for WD Tagger backbones (SwinV2, ConvNeXt, ViT, EVA02) with automatic classifier-head expansion and optional k-bit quantization.
+- **Inference** – Tag images locally with threshold controls using WD Tagger backbones (extendable to custom adapters).
 
 ## Prerequisites
 
-- Python 3.11 or higher
+- Python 3.11 or newer
 - [uv](https://github.com/astral-sh/uv) package manager
-- CUDA-capable GPU (recommended for training)
+- CUDA-capable GPU recommended for training (CPU and 4/8-bit modes are supported for experimentation)
 
 ## Installation
-
-Clone the repository and install dependencies:
 
 ```bash
 git clone https://github.com/nusu-github/WDTaggerAppend.git
@@ -26,255 +22,173 @@ cd WDTaggerAppend
 uv sync
 ```
 
-This will install all required dependencies including PyTorch with CUDA support on Linux/Windows, or CPU-only on other platforms.
+`uv sync` installs the managed virtual environment declared in `pyproject.toml`, including the correct PyTorch build (CUDA on Linux/Windows, CPU elsewhere).
 
-The CLI commands can be invoked using the installed entry points (e.g., `wd-tagger-train`) or via `python -m` (e.g., `python -m wd_tagger_append.train`).
+Invoke the CLIs with `uv run wd-tagger-<command> …` or `python -m wd_tagger_append.<module> …`.
 
 ## Quick Start
 
-### 1. Dataset Preparation and Upload
-
-Prepare and upload a local dataset folder to Hugging Face Hub:
+### 1. Prepare a dataset
 
 ```bash
-python -m wd_tagger_append.prepare_dataset datasets/your_dataset username/dataset-name \
-  --model-name eva02-large \
+uv run wd-tagger-prepare datasets/anime_set \
+  --output-dir datasets/processed/anime_set \
+  --push-to-hub \
+  --hub-repo username/anime-set \
   --private
 ```
 
-**Options:**
+Key options:
 
-- `--model-name`: Base model to use for label initialization (default: `eva02-large`)
-  - Available models: `convnext`, `eva02-large`, `swinv2`, `vit-large`, `vit`
-- `--private`: Create as a private dataset (default: `True`)
-- `--token`: Hugging Face API token (reads from `HF_TOKEN` environment variable if not provided)
+- `--output-dir`: Save the Arrow dataset to disk (omit to skip).
+- `--push-to-hub`: Upload the resulting `DatasetDict`; needs `--hub-repo`.
+- `--hub-repo`: Target repo such as `username/dataset-name`.
+- `--private`: Create the Hub repo as private.
 
-### 2. Model Training
-
-Train a LoRA adapter on your dataset. The tool supports both local folders and Hugging Face Hub datasets.
-
-#### Train from Local Dataset
+### 2. Train a LoRA adapter
 
 ```bash
-python -m wd_tagger_append.train datasets/your_dataset \
-  --model-name eva02-large \
-  --output-dir ./output
+uv run wd-tagger-train \
+  --dataset-path datasets/processed/anime_set \
+  --model eva02-large \
+  --output-dir output/anime_set_eva02_lora \
+  --train-batch-size 8 \
+  --gradient-accumulation-steps 2 \
+  --learning-rate 3e-5 \
+  --num-epochs 3 \
+  --lora-rank 16 \
+  --lora-alpha 32 \
+  --lora-dropout 0.05 \
+  --precision bf16
 ```
 
-#### Train from Hugging Face Hub Dataset
+Alternative: `--dataset-name username/anime-set` (optionally with `--dataset-config`) to stream from the Hub.
+
+Important knobs:
+
+- `--model`: Backbone key from `MODEL_REPO_MAP` (`swinv2`, `convnext`, `vit`, `vit-large`, `eva02-large`).
+- `--train-batch-size`, `--eval-batch-size`, `--gradient-accumulation-steps`: Control memory vs. throughput.
+- `--learning-rate`, `--num-epochs`, `--weight-decay`, `--warmup-ratio`: Optimisation parameters.
+- `--lora-rank`, `--lora-alpha`, `--lora-dropout`: PEFT LoRA hyperparameters.
+- `--mixup-alpha`: Enable torchvision MixUp during batching.
+- `--load-in-4bit` / `--load-in-8bit`: Activate BitsAndBytes quantised loading; works with `--precision` (`fp32`, `bf16`, `fp16`).
+- `--metrics-top-k`: Report Precision@K / Recall@K / nDCG@K for chosen cut-offs (repeat to add values).
+- `--metrics-propensity`: Add propensity-scored nDCG@K using dataset tag frequencies (requires `--metrics-top-k`).
+- `--push-to-hub`, `--hub-model-id`, `--hub-token`: Push adapters automatically after training.
+
+The trainer writes checkpoints plus a `label_mapping.json` (merged base + dataset tags) to `output-dir`.
+
+### 3. Run inference
 
 ```bash
-python -m wd_tagger_append.train username/dataset-name \
-  --model-name eva02-large \
-  --output-dir ./output \
-  --token YOUR_TOKEN
-```
-
-**Training Options:**
-
-- `--batch-size`: Training batch size per device (default: `4`)
-- `--gradient-accumulation-steps`: Number of gradient accumulation steps (default: `4`)
-- `--learning-rate`: Learning rate for AdamW optimizer (default: `5e-3`)
-- `--num-epochs`: Total number of training epochs (default: `5`)
-- `--lora-r`: LoRA attention dimension (default: `16`)
-- `--lora-alpha`: LoRA scaling factor (default: `16`)
-- `--lora-dropout`: LoRA dropout probability (default: `0.0`)
-- `--test-size`: Validation split ratio (default: `0.1`)
-- `--seed`: Random seed for reproducibility (default: `42`)
-- `--fp16/--no-fp16`: Enable mixed precision training (default: `True` if CUDA available)
-- `--consistency-weight`: Strength of the teacher KL penalty (default: `0.2`; set to `0` to disable)
-- `--consistency-warmup-ratio`: Fraction of total steps spent ramping in the penalty (default: `0.0`)
-
-### 3. Inference
-
-Run inference on images using pre-trained or custom-trained models:
-
-```bash
-python -m wd_tagger_append.infer path/to/image.jpg \
-  --model-id-or-path SmilingWolf/wd-eva02-large-tagger-v3
-```
-
-**Using a Custom Trained Model:**
-
-```bash
-python -m wd_tagger_append.infer path/to/image.jpg \
-  --model-id-or-path ./output/checkpoint-final \
-  --gen-threshold 0.3 \
+uv run wd-tagger-infer path/to/sample.jpg \
+  --model eva02-large \
+  --gen-threshold 0.35 \
   --char-threshold 0.7
 ```
 
-**Inference Options:**
-
-- `--model-id-or-path`: Hugging Face Hub model ID or local path to model/adapter (default: `SmilingWolf/wd-eva02-large-tagger-v3`)
-- `--gen-threshold`: Confidence threshold for general tags (default: `0.35`, range: `0.0-1.0`)
-- `--char-threshold`: Confidence threshold for character tags (default: `0.75`, range: `0.0-1.0`)
-- `--token`: Hugging Face API token for private models
-- `--discard-existing-tags/--keep-existing-tags`: Control whether previously stored tags are merged (default: keep)
-
-### 4. Merge and Upload Model
-
-After training, merge your LoRA adapter with the base model and upload to Hugging Face Hub:
+Use a fine-tuned adapter (the CLI auto-detects `label_mapping.json` if it exists in the adapter directory):
 
 ```bash
-python -m wd_tagger_append.merge_and_upload \
-  SmilingWolf/wd-eva02-large-tagger-v3 \
-  ./output/checkpoint-final \
-  my-custom-tagger \
-  --private \
-  --token YOUR_TOKEN
+uv run wd-tagger-infer path/to/sample.jpg \
+  --model eva02-large \
+  --adapter output/anime_set_eva02_lora \
+  --gen-threshold 0.35 \
+  --char-threshold 0.7
 ```
 
-This creates a standalone model with custom processing code that can be loaded with `trust_remote_code=True`.
+Options:
 
-### 5. Upload Extended Tags
+- `--model`: Backbone key, repo ID, or local base model path.
+- `--repo-id`: Override the base model repo/path when `--model` is only a key.
+- `--adapter`: Load a PEFT adapter from a local directory or Hub repo (e.g. `output/...`).
+- `--labels-path`: Provide a custom `label_mapping.json` or `selected_tags.csv` (defaults to adapter/base assets).
+- `--gen-threshold`, `--char-threshold`: Filter probabilities for general/character tags.
+- `--load-in-4bit/--no-load-in-4bit`: Toggle 4-bit NF4 inference (default: on).
+- `--load-in-8bit/--no-load-in-8bit`: Toggle 8-bit inference.
+- `--token`: Hugging Face token for private repos.
 
-Generate and upload an extended tag CSV file to your dataset repository:
+## Dataset format
 
-```bash
-python -m wd_tagger_append.upload_tags \
-  datasets/your_dataset \
-  username/dataset-name \
-  --model-name eva02-large \
-  --token YOUR_TOKEN
-```
-
-This analyzes your dataset for new tags not present in the base model and creates a `selected_tags.csv` file.
-
-## Dataset Format
-
-Organize your dataset with paired image and JSON metadata files:
-
-```text
-datasets/
-  your_dataset/
-    image1.jpg
-    image1.jpg.json
-    image2.png
-    image2.png.json
-    subfolder/
-      image3.jpg
-      image3.jpg.json
-    ...
-```
-
-Each `.json` file must contain the following fields:
+`wd-tagger-prepare` expects Danbooru-style `{image}.{ext}` + `{image}.{ext}.json` pairs. Minimal JSON structure:
 
 ```json
 {
-  "md5": "abc123...",
-  "rating": "g",
-  "tags_general": ["1girl", "solo", "smile", "long_hair"],
-  "tags_character": ["hatsune_miku"]
+  "md5": "abc123…",
+  "rating": "s",
+  "score": 42,
+  "source": "https://danbooru.donmai.us/posts/123",
+  "tag_string_general": "1girl solo smile long_hair",
+  "tag_string_character": "hatsune_miku",
+  "tag_string_copyright": "vocaloid",
+  "tag_string_artist": "piapro",
+  "tag_string_meta": ""
 }
 ```
 
-**Field Descriptions:**
+Missing tag strings default to empty lists. Ratings follow Danbooru’s codes (`s`, `q`, `e`, etc.). The tool deduplicates by `md5`, records the `score`/`source`, and produces multi-hot labels for general, character, copyright, artist, and meta categories.
 
-- `md5`: MD5 hash of the image file (for verification)
-- `rating`: Content rating - one of `general`, `sensitive`, `questionable`, or `explicit`
-- `tags_general`: List of general descriptive tags
-- `tags_character`: List of character name tags
+## Example pipeline
 
-## Complete Workflow Example
+1. **Prepare** (machine A):
 
-This example demonstrates the full pipeline from dataset preparation to model deployment.
+   ```bash
+   uv run wd-tagger-prepare datasets/anime_characters \
+     --push-to-hub \
+     --hub-repo username/anime-characters \
+     --private
+   ```
 
-### Step 1: Prepare Dataset (Machine A)
+2. **Train** (GPU machine B):
 
-```bash
-# Upload your local dataset to Hugging Face Hub
-python -m wd_tagger_append.prepare_dataset datasets/anime_characters username/anime-characters-dataset \
-  --model-name eva02-large \
-  --private \
-  --token $HF_TOKEN
-```
+   ```bash
+   uv run wd-tagger-train \
+     --dataset-name username/anime-characters \
+     --model eva02-large \
+     --output-dir output/anime_characters_eva02 \
+     --train-batch-size 8 \
+     --gradient-accumulation-steps 2 \
+     --learning-rate 3e-5 \
+     --num-epochs 3 \
+     --lora-rank 16 \
+     --lora-alpha 32 \
+     --precision bf16 \
+     --push-to-hub \
+     --hub-model-id username/anime-characters-eva02-lora
+   ```
 
-### Step 2: Train Model (Machine B with GPU)
+3. **Infer** (any machine):
 
-```bash
-# Download from Hub and train with custom parameters
-python -m wd_tagger_append.train username/anime-characters-dataset \
-  --model-name eva02-large \
-  --output-dir ./trained_adapters \
-  --token $HF_TOKEN \
-  --batch-size 8 \
-  --num-epochs 10 \
-  --learning-rate 1e-4 \
-  --lora-r 32
-```
-
-### Step 3: Merge and Deploy
-
-```bash
-# Merge adapter with base model and upload
-python -m wd_tagger_append.merge_and_upload \
-  SmilingWolf/wd-eva02-large-tagger-v3 \
-  ./trained_adapters/checkpoint-final \
-  anime-character-tagger \
-  --token $HF_TOKEN
-```
-
-### Step 4: Run Inference
-
-```bash
-# Use your deployed model for inference
-python -m wd_tagger_append.infer test_image.jpg \
-  --model-id-or-path username/anime-character-tagger \
-  --gen-threshold 0.3 \
-  --token $HF_TOKEN
-```
+   ```bash
+   uv run wd-tagger-infer path/to/test.jpg \
+     --model eva02-large \
+     --adapter output/anime_characters_eva02 \
+     --gen-threshold 0.4 \
+     --char-threshold 0.6
+   ```
 
 ## Development
 
-### Code Quality
-
 ```bash
-# Run linter
-ruff check .
-
-# Auto-format code
-ruff format .
+# Formatting / linting
+uv run ruff format .
+uv run ruff check .
 
 # Type checking
-pyright
+uv run pyright
+
+# Tests (add selectors as needed)
+uv run pytest
 ```
 
-### Testing
+## Supported backbones
 
-```bash
-# Run all tests
-pytest
-
-# Run specific test file
-pytest tests/test_upload_tags.py
-
-# Run with coverage
-pytest --cov=wd_tagger_append
-```
-
-## Supported Models
-
-This toolkit supports the following WD Tagger v3 models from SmilingWolf:
-
-- `wd-convnext-tagger-v3`
-- `wd-eva02-large-tagger-v3` (recommended)
-- `wd-swinv2-tagger-v3`
-- `wd-vit-large-tagger-v3`
-- `wd-vit-tagger-v3`
-
-## Acknowledgments
-
-Built on top of the excellent WD Tagger models by [SmilingWolf](https://huggingface.co/SmilingWolf).
+- `SmilingWolf/wd-swinv2-tagger-v3`
+- `SmilingWolf/wd-convnext-tagger-v3`
+- `SmilingWolf/wd-vit-tagger-v3`
+- `SmilingWolf/wd-vit-large-tagger-v3`
+- `SmilingWolf/wd-eva02-large-tagger-v3`
 
 ## License
 
-Licensed under either of:
-
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
-- MIT license ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
-
-at your option.
-
-### Contribution
-
-Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
+Dual licensed under the MIT License and the Apache License 2.0. See `LICENSE-MIT` and `LICENSE-APACHE` for details.
