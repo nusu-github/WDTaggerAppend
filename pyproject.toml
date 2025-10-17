@@ -32,9 +32,9 @@ classifiers = [
 ]
 dependencies = [
   "accelerate>=1.10.1",
+  "bitsandbytes>=0.48.1",
   "datasets[vision]>=4.2.0",
   "evaluate>=0.4.6",
-  "gradio>=5.49.1",
   "huggingface-hub>=0.35.3",
   "numpy>=2.2.6",
   "pandas>=2.3.3",
@@ -42,10 +42,12 @@ dependencies = [
   "pillow>=11.3.0",
   "timm>=1.0.20",
   "torch>=2.8.0",
+  "torchmetrics>=1.8.2",
   "torchvision>=0.23.0",
   "tqdm>=4.67.1",
   "transformers>=4.57.0",
   "typer>=0.19.2",
+  "wandb>=0.22.2",
 ]
 
 [tool.uv.sources]
@@ -65,21 +67,15 @@ url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [project.scripts]
-wd-tagger-train = "wd_tagger_append.train:main"
+wd-tagger-prepare = "wd_tagger_append.prepare_dataset:app"
 wd-tagger-infer = "wd_tagger_append.infer:main"
-wd-tagger-prepare = "wd_tagger_append.prepare_dataset:main"
-wd-tagger-upload-tags = "wd_tagger_append.upload_tags:main"
-wd-tagger-merge-upload = "wd_tagger_append.merge_and_upload:main"
+wd-tagger-train = "wd_tagger_append.train:app"
 
 [dependency-groups]
-dev = [
-  "pip-licenses>=5.0.0",
-  "pyright>=1.1.405",
-  "pytest>=8.4.2",
-  "ruff>=0.13.0",
-]
+dev = ["pyright>=1.1.405", "pytest>=8.4.2", "ruff>=0.13.0"]
 
 [tool.ruff]
+include = ["src/**/*.py", "tests/**/*.py"]
 extend-exclude = []
 line-length = 100
 target-version = "py311"
@@ -100,8 +96,8 @@ isort = { combine-as-imports = true, known-first-party = ["wd_tagger_append"] }
 [tool.ruff.format]
 line-ending = "lf"
 
-[tool.pyright]
-typeCheckingMode = "standard"
-
 [tool.ruff.lint.pydocstyle]
 convention = "google"
+
+[tool.pyright]
+include = ["src"]

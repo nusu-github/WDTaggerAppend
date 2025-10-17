@@ -1,189 +1,518 @@
-"""CLI tool for model inference."""
+from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, cast
+from typing import Annotated, Any
 
+import numpy as np
+import pandas as pd
 import torch
 import typer
+from huggingface_hub import hf_hub_download
+from huggingface_hub.errors import HfHubHTTPError
+from peft import PeftConfig, PeftModel
 from PIL import Image
 from torch import Tensor
+from torch.nn import functional as F
 from transformers import (
-    AutoImageProcessor,
     AutoModelForImageClassification,
-    TimmWrapperForImageClassification,
-    TimmWrapperImageProcessor,
+    BitsAndBytesConfig,
 )
 
-from wd_tagger_append.labels import ModelLabels, load_labels_from_hub
-from wd_tagger_append.prediction import TagPredictionResult
+from wd_tagger_append.augmentation import create_eval_transform
+from wd_tagger_append.dataset_utils import load_label_mapping
 
-if TYPE_CHECKING:
-    from peft import PeftModel
-    from transformers.modeling_outputs import ImageClassifierOutput
+app = typer.Typer(help="WD Tagger v3 inference with timm")
 
-app = typer.Typer(help="WD Tagger image inference tool")
+MODEL_REPO_MAP = {
+    "swinv2": "SmilingWolf/wd-swinv2-tagger-v3",
+    "convnext": "SmilingWolf/wd-convnext-tagger-v3",
+    "vit": "SmilingWolf/wd-vit-tagger-v3",
+    "vit-large": "SmilingWolf/wd-vit-large-tagger-v3",
+    "eva02-large": "SmilingWolf/wd-eva02-large-tagger-v3",
+}
 
-torch_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+@dataclass
+class LabelData:
+    names: list[str]
+    rating: list[np.int64]
+    general: list[np.int64]
+    character: list[np.int64]
+
+
+LABEL_MAPPING_FILENAME = "label_mapping.json"
+
+
+def _load_labels_from_csv(csv_path: Path) -> LabelData:
+    """Load label metadata from a selected_tags.csv file."""
+    df: pd.DataFrame = pd.read_csv(csv_path)
+    return LabelData(
+        names=df["name"].tolist(),
+        rating=list(np.where(df["category"] == 9)[0]),
+        general=list(np.where(df["category"] == 0)[0]),
+        character=list(np.where(df["category"] == 4)[0]),
+    )
+
+
+def _resolve_base_model_identifier(model: str, repo_override: str | None) -> str:
+    """Resolve the base model repo or path from CLI inputs."""
+    if repo_override:
+        return repo_override
+    if model in MODEL_REPO_MAP:
+        return MODEL_REPO_MAP[model]
+    return model
+
+
+def _is_local_path(source: str) -> bool:
+    """Return True if the given source refers to an existing local path."""
+    try:
+        return Path(source).expanduser().exists()
+    except OSError:
+        return False
+
+
+def _create_quantization_config(
+    load_in_4bit: bool,
+    load_in_8bit: bool,
+    compute_dtype: torch.dtype | None,
+) -> BitsAndBytesConfig | None:
+    """Construct a BitsAndBytes quantization configuration if requested."""
+    if not load_in_4bit and not load_in_8bit:
+        return None
+    if load_in_4bit and load_in_8bit:
+        msg = "Choose only one of --load-in-4bit or --load-in-8bit."
+        raise typer.BadParameter(msg)
+
+    kwargs: dict[str, Any] = {
+        "load_in_4bit": load_in_4bit,
+        "load_in_8bit": load_in_8bit,
+    }
+    if load_in_4bit:
+        kwargs["bnb_4bit_use_double_quant"] = True
+        kwargs["bnb_4bit_quant_type"] = "nf4"
+        if compute_dtype is not None:
+            kwargs["bnb_4bit_compute_dtype"] = compute_dtype
+    return BitsAndBytesConfig(**kwargs)
+
+
+def _parse_precision(precision: str | None) -> torch.dtype | None:
+    """Parse precision flag into torch dtype."""
+    if precision is None or precision.lower() == "fp32":
+        return None
+    normalized = precision.lower()
+    if normalized == "bf16":
+        return torch.bfloat16
+    if normalized == "fp16":
+        return torch.float16
+    msg = "Precision must be one of: fp32, bf16, fp16."
+    raise typer.BadParameter(msg)
+
+
+def _build_label_data_from_mapping(
+    mapping: dict[str, int],
+    base_labels: LabelData,
+) -> LabelData:
+    """Create LabelData from a tag->index mapping, using base categories as hints."""
+    num_labels = len(mapping)
+    names: list[str | None] = [None] * num_labels
+    for tag, index in mapping.items():
+        if index < 0 or index >= num_labels:
+            msg = f"Invalid label index {index} for tag '{tag}' in mapping."
+            raise typer.BadParameter(msg)
+        names[index] = tag
+
+    missing = [idx for idx, name in enumerate(names) if name is None]
+    if missing:
+        msg = "Label mapping is incomplete; missing labels for indices: " + ", ".join(
+            str(idx) for idx in missing
+        )
+        raise typer.BadParameter(msg)
+
+    # Build lookup tables from the base label metadata to infer categories.
+    base_general = {base_labels.names[idx] for idx in base_labels.general}
+    base_character = {base_labels.names[idx] for idx in base_labels.character}
+    base_rating = {base_labels.names[idx] for idx in base_labels.rating}
+
+    rating: list[np.int64] = []
+    general: list[np.int64] = []
+    character: list[np.int64] = []
+
+    for idx, tag in enumerate(names):
+        assert tag is not None
+        if tag in base_rating:
+            rating.append(np.int64(idx))
+        if tag in base_character:
+            character.append(np.int64(idx))
+        if tag in base_general or tag in base_character or tag in base_rating:
+            if tag in base_general:
+                general.append(np.int64(idx))
+        else:
+            # Default new labels to the general category.
+            general.append(np.int64(idx))
+
+    return LabelData(
+        names=[str(name) for name in names],
+        rating=rating,
+        general=general,
+        character=character,
+    )
+
+
+def _load_label_mapping_from_source(
+    source: str | None,
+    adapter: str | None,
+    adapter_revision: str | None,
+    adapter_token: str | None,
+) -> Path | None:
+    """Locate a label mapping JSON file from CLI options or adapter repo."""
+    if source is not None:
+        path = Path(source).expanduser()
+        if not path.exists():
+            msg = f"Label mapping file not found: {source}"
+            raise typer.BadParameter(msg)
+        return path
+
+    if adapter is None:
+        return None
+
+    # Try to resolve local adapter first.
+    if _is_local_path(adapter):
+        candidate = Path(adapter) / LABEL_MAPPING_FILENAME
+        if candidate.exists():
+            return candidate
+        return None
+
+    try:
+        downloaded = hf_hub_download(
+            repo_id=adapter,
+            filename=LABEL_MAPPING_FILENAME,
+            revision=adapter_revision,
+            token=adapter_token,
+        )
+        return Path(downloaded)
+    except HfHubHTTPError:
+        return None
+
+
+def _load_label_data(
+    base_repo: str,
+    revision: str | None,
+    token: str | None,
+    labels_path: Path | None,
+    adapter: str | None,
+    adapter_revision: str | None,
+    adapter_token: str | None,
+    fallback_repo: str | None = None,
+) -> LabelData:
+    """Load label metadata, falling back to the base model's selected_tags.csv."""
+    base_labels: LabelData
+    if _is_local_path(base_repo):
+        local_csv = Path(base_repo).expanduser() / "selected_tags.csv"
+        if local_csv.exists():
+            base_labels = _load_labels_from_csv(local_csv)
+        elif fallback_repo is not None and not _is_local_path(fallback_repo):
+            typer.echo(
+                f"selected_tags.csv not found locally; downloading labels from '{fallback_repo}'.",
+            )
+            base_labels = load_labels_hf(
+                repo_id=fallback_repo,
+                revision=revision,
+                token=token,
+            )
+        else:
+            typer.echo(
+                "Warning: selected_tags.csv not found in local base model directory; "
+                "category data for new labels will default to 'general'.",
+                err=True,
+            )
+            base_labels = LabelData(names=[], rating=[], general=[], character=[])
+    else:
+        base_labels = load_labels_hf(repo_id=base_repo, revision=revision, token=token)
+
+    mapping_path = _load_label_mapping_from_source(
+        str(labels_path) if labels_path is not None else None,
+        adapter=adapter,
+        adapter_revision=adapter_revision,
+        adapter_token=adapter_token,
+    )
+    if mapping_path is None:
+        return base_labels
+
+    typer.echo(f"Loading label mapping from {mapping_path}...")
+    mapping = load_label_mapping(mapping_path)
+    return _build_label_data_from_mapping(mapping, base_labels)
+
+
+def load_labels_hf(
+    repo_id: str,
+    revision: str | None = None,
+    token: str | None = None,
+) -> LabelData:
+    try:
+        csv_path = hf_hub_download(
+            repo_id=repo_id,
+            filename="selected_tags.csv",
+            revision=revision,
+            token=token,
+        )
+        csv_path = Path(csv_path).resolve()
+    except HfHubHTTPError as e:
+        msg = f"selected_tags.csv failed to download from {repo_id}"
+        raise FileNotFoundError(msg) from e
+
+    return _load_labels_from_csv(csv_path)
 
 
 def get_tags(
     probs: Tensor,
-    labels: ModelLabels,
+    labels: LabelData,
     gen_threshold: float,
     char_threshold: float,
-) -> TagPredictionResult:
-    """Extract tags from prediction results.
+) -> tuple[str, str, dict[str, float], dict[str, float], dict[str, float]]:
+    # Convert model probabilities into python floats to keep typing simple
+    prob_values = probs.detach().cpu().numpy().tolist()
 
-    Args:
-        probs: Prediction probability tensor
-        labels: Label information
-        gen_threshold: Threshold for general tags
-        char_threshold: Threshold for character tags
-
-    Returns:
-        Structured prediction results
-    """
-    # Convert indices and probabilities to labels
-    label_probs: list[tuple[str, float]] = [
-        (label, float(score)) for label, score in zip(labels.names, probs.numpy(), strict=False)
-    ]
-
-    # Rating labels
-    rating_labels = {
-        label_probs[int(idx)][0]: label_probs[int(idx)][1] for idx in labels.rating_indices
+    rating_labels: dict[str, float] = {
+        labels.names[i]: float(prob_values[i]) for i in labels.rating
     }
 
-    # General tags (those exceeding threshold)
     general_candidates = [
-        label_probs[int(idx)]
-        for idx in labels.general_indices
-        if label_probs[int(idx)][1] > gen_threshold
+        (labels.names[i], float(prob_values[i]))
+        for i in labels.general
+        if prob_values[i] > gen_threshold
     ]
-    general_candidates.sort(key=lambda item: item[1], reverse=True)
-    gen_labels = dict(general_candidates)
+    gen_labels: dict[str, float] = dict(
+        sorted(general_candidates, key=lambda item: item[1], reverse=True),
+    )
 
-    # Character tags (those exceeding threshold)
     character_candidates = [
-        label_probs[int(idx)]
-        for idx in labels.character_indices
-        if label_probs[int(idx)][1] > char_threshold
+        (labels.names[i], float(prob_values[i]))
+        for i in labels.character
+        if prob_values[i] > char_threshold
     ]
-    character_candidates.sort(key=lambda item: item[1], reverse=True)
-    char_labels = dict(character_candidates)
+    char_labels: dict[str, float] = dict(
+        sorted(character_candidates, key=lambda item: item[1], reverse=True),
+    )
 
-    # Combine and sort general and character tags
-    combined_candidates = general_candidates + character_candidates
-    combined_names = [label for label, _ in combined_candidates]
+    combined_names = [name for name, _ in general_candidates]
+    combined_names.extend(name for name, _ in character_candidates)
 
-    # Convert to string usable as training caption
     caption = ", ".join(combined_names)
     taglist = caption.replace("_", " ").replace("(", r"\(").replace(")", r"\)")
 
-    return TagPredictionResult(
-        caption=caption,
-        taglist=taglist,
-        rating_labels=rating_labels,
-        character_labels=char_labels,
-        general_labels=gen_labels,
-    )
+    return caption, taglist, rating_labels, char_labels, gen_labels
 
 
 @app.command()
-def infer(
-    image_file: Annotated[Path, typer.Argument(help="Path to the image file for inference")],
-    model_id_or_path: Annotated[
+def main(
+    image_file: Annotated[Path, typer.Argument(help="Path to the image file")],
+    model: Annotated[
         str,
+        typer.Option("--model", "-m", help="Model key, repo ID, or local path for the base model."),
+    ] = "eva02-large",
+    repo_id: Annotated[
+        str | None,
         typer.Option(
+            "--repo-id",
             help=(
-                "Hugging Face Hub model ID or local path to a PEFT model adapter or a base model."
+                "Override the base model repo or directory (defaults to --model / MODEL_REPO_MAP)."
             ),
         ),
-    ] = "SmilingWolf/wd-eva02-large-tagger-v3",
+    ] = None,
+    adapter: Annotated[
+        str | None,
+        typer.Option(
+            "--adapter",
+            help=("Optional PEFT LoRA adapter repo ID or local path produced by wd-tagger-train."),
+        ),
+    ] = None,
+    labels_path: Annotated[
+        Path | None,
+        typer.Option(
+            "--labels-path",
+            help="Optional label_mapping.json or selected_tags.csv to override label metadata.",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            resolve_path=True,
+        ),
+    ] = None,
+    revision: Annotated[
+        str | None,
+        typer.Option("--revision", help="Revision or branch to use for the base model."),
+    ] = None,
+    adapter_revision: Annotated[
+        str | None,
+        typer.Option("--adapter-revision", help="Revision or branch to use for the adapter."),
+    ] = None,
+    token: Annotated[
+        str | None,
+        typer.Option("--token", help="Hugging Face token for private base models."),
+    ] = None,
+    adapter_token: Annotated[
+        str | None,
+        typer.Option(
+            "--adapter-token",
+            help="Hugging Face token for private adapters (defaults to --token).",
+        ),
+    ] = None,
     gen_threshold: Annotated[
         float,
-        typer.Option(help="Threshold for general tags", min=0.0, max=1.0),
+        typer.Option(help="Threshold for general tags"),
     ] = 0.35,
     char_threshold: Annotated[
         float,
-        typer.Option(help="Threshold for character tags", min=0.0, max=1.0),
+        typer.Option(help="Threshold for character tags"),
     ] = 0.75,
-    token: Annotated[str | None, typer.Option(help="Hugging Face API token")] = None,
-    discard_existing_tags: Annotated[
+    load_in_4bit: Annotated[
         bool,
         typer.Option(
-            "--discard-existing-tags/--keep-existing-tags",
-            help="Discard any stored tags instead of merging with current predictions",
+            "--load-in-4bit/--no-load-in-4bit",
+            help="Enable 4-bit NF4 quantized loading (default: enabled).",
+        ),
+    ] = True,
+    load_in_8bit: Annotated[
+        bool,
+        typer.Option(
+            "--load-in-8bit/--no-load-in-8bit",
+            help="Enable 8-bit quantized loading (default: disabled).",
         ),
     ] = False,
+    precision: Annotated[
+        str | None,
+        typer.Option(
+            "--precision",
+            help="Precision for non-quantized weights: fp32, bf16, or fp16.",
+        ),
+    ] = None,
+    device_map: Annotated[
+        str | None,
+        typer.Option("--device-map", help="Device map for model loading (default: auto)."),
+    ] = "auto",
 ) -> None:
-    """Execute tag inference on an image."""
-    # Validate image path
-    image_path = Path(image_file).resolve()
+    image_path = image_file.resolve()
     if not image_path.is_file():
         typer.echo(f"Error: Image file not found: {image_path}", err=True)
-        raise typer.Exit(1)
+        raise typer.Exit(code=1)
 
-    model: TimmWrapperForImageClassification | PeftModel
-    transform: TimmWrapperImageProcessor
-    typer.echo(f"Loading model and processor from {model_id_or_path}...")
-    # trust_remote_code=True allows loading our custom processor
-    transform = AutoImageProcessor.from_pretrained(
-        model_id_or_path,
-        token=token,
-        trust_remote_code=True,
-    )
-    model = AutoModelForImageClassification.from_pretrained(
-        model_id_or_path,
-        token=token,
-        trust_remote_code=True,
+    adapter_token_final = adapter_token or token
+    base_identifier = _resolve_base_model_identifier(model, repo_id)
+
+    peft_config: PeftConfig | None = None
+    if adapter is not None:
+        typer.echo(f"Loading adapter config from '{adapter}'...")
+        peft_config = PeftConfig.from_pretrained(
+            adapter,
+            revision=adapter_revision,
+            token=adapter_token_final,
+        )
+        adapter_base = peft_config.base_model_name_or_path
+        if repo_id is None and model in MODEL_REPO_MAP:
+            base_identifier = adapter_base
+        typer.echo(
+            "Adapter trained on base model "
+            f"'{adapter_base}'. Using '{base_identifier}' for inference.",
+        )
+
+    precision_dtype = _parse_precision(precision)
+    quantization_config = _create_quantization_config(load_in_4bit, load_in_8bit, precision_dtype)
+
+    base_kwargs: dict[str, Any] = {}
+    if quantization_config is not None:
+        base_kwargs["quantization_config"] = quantization_config
+    if precision_dtype is not None and quantization_config is None:
+        base_kwargs["torch_dtype"] = precision_dtype
+    if device_map is not None:
+        base_kwargs["device_map"] = device_map
+    if token is not None:
+        base_kwargs["token"] = token
+    if revision is not None and not _is_local_path(base_identifier):
+        base_kwargs["revision"] = revision
+
+    typer.echo(f"Loading base model from '{base_identifier}'...")
+    hf_model = AutoModelForImageClassification.from_pretrained(
+        base_identifier,
+        **base_kwargs,
     )
 
-    typer.echo("Loading tag list from Hub...")
-    labels = load_labels_from_hub(repo_id=model_id_or_path, token=token)
+    if adapter is not None:
+        adapter_kwargs: dict[str, Any] = {"is_trainable": False}
+        if adapter_token_final is not None:
+            adapter_kwargs["token"] = adapter_token_final
+        if adapter_revision is not None:
+            adapter_kwargs["revision"] = adapter_revision
+        typer.echo(f"Applying adapter weights from '{adapter}'...")
+        hf_model = PeftModel.from_pretrained(hf_model, adapter, **adapter_kwargs)
+
+    hf_model = hf_model.eval()
+
+    typer.echo("Loading label metadata...")
+    labels: LabelData = _load_label_data(
+        base_repo=base_identifier,
+        revision=revision,
+        token=token,
+        labels_path=labels_path,
+        adapter=adapter,
+        adapter_revision=adapter_revision,
+        adapter_token=adapter_token_final,
+        fallback_repo=(peft_config.base_model_name_or_path if peft_config is not None else None),
+    )
+
+    typer.echo("Creating data transform...")
+    transforms = create_eval_transform(base_identifier)
 
     typer.echo("Loading image and preprocessing...")
-    img_input = Image.open(str(image_path))
-    # The custom processor now handles padding, resizing, and BGR conversion
-    inputs = transform(images=img_input, return_tensors="pt")["pixel_values"]
+    img_input: Image.Image = Image.open(image_path)
+    inputs = transforms(img_input).unsqueeze(0)  # Add batch dimension
+
+    # Move inputs to the primary device if necessary.
+    if hasattr(hf_model, "device"):
+        inputs = inputs.to(hf_model.device)
+    else:
+        try:
+            first_param = next(hf_model.parameters())
+            inputs = inputs.to(first_param.device)
+        except StopIteration:
+            inputs = inputs.to("cpu")
 
     typer.echo("Running inference...")
     with torch.inference_mode():
-        if torch_device.type != "cpu":
-            model = cast("Any", model).to(device=torch_device)
-            inputs = inputs.to(torch_device)
-
-        model_output = cast("ImageClassifierOutput", model(pixel_values=inputs))
-        logits = model_output.logits
-        if logits is None:
-            msg = "Model output did not include logits."
-            raise RuntimeError(msg)
-        outputs = torch.sigmoid(logits)
-
-        if torch_device.type != "cpu":
-            inputs = inputs.to("cpu")
-            outputs = outputs.to("cpu")
-            model = cast("Any", model).to(device="cpu")
+        # run the model
+        outputs = hf_model(inputs).logits
+        # apply the final activation function (timm doesn't support doing this internally)
+        outputs = F.sigmoid(outputs)
 
     typer.echo("Processing results...")
-    if discard_existing_tags:
-        typer.echo("Discarding stored tags (merge behaviour will be wired in a future update).")
-    else:
-        typer.echo("Keeping stored tags when merge support lands.")
-    result = get_tags(
-        probs=outputs.squeeze(0),
+    caption, taglist, ratings, character, general = get_tags(
+        probs=outputs.to("cpu").squeeze(0),
         labels=labels,
         gen_threshold=gen_threshold,
         char_threshold=char_threshold,
     )
 
-    typer.echo(result.format_summary())
+    typer.echo("--------")
+    typer.echo(f"Caption: {caption}")
+    typer.echo("--------")
+    typer.echo(f"Tags: {taglist}")
+
+    typer.echo("--------")
+    typer.echo("Ratings:")
+    for k, v in ratings.items():
+        typer.echo(f"  {k}: {v:.3f}")
+
+    typer.echo("--------")
+    typer.echo(f"Character tags (threshold={char_threshold}):")
+    for k, v in character.items():
+        typer.echo(f"  {k}: {v:.3f}")
+
+    typer.echo("--------")
+    typer.echo(f"General tags (threshold={gen_threshold}):")
+    for k, v in general.items():
+        typer.echo(f"  {k}: {v:.3f}")
+
     typer.echo("Done!")
 
 
-def main() -> None:
-    """Main entry point."""
-    app()
-
-
 if __name__ == "__main__":
-    main()
+    app()

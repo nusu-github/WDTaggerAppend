@@ -1,787 +1,597 @@
-"""CLI tool for model training."""
+"""CLI for LoRA fine-tuning of WD tagger models using Hugging Face Trainer."""
 
-from collections.abc import Callable
+from __future__ import annotations
+
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, cast
+from typing import TYPE_CHECKING, Annotated, Any, Literal, NoReturn, cast
 
 import torch
 import typer
-from huggingface_hub import HfApi
-from peft import LoraConfig, PeftModel, get_peft_model
+from huggingface_hub.errors import HfHubHTTPError
+from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
+from torch import Tensor, nn
 from transformers import (
     AutoImageProcessor,
     AutoModelForImageClassification,
-    PreTrainedModel,
-    TimmWrapperImageProcessor,
+    BitsAndBytesConfig,
+    DefaultDataCollator,
+    Trainer,
     TrainingArguments,
 )
+from typer import BadParameter
 
-from datasets import Dataset, Sequence as DatasetSequence, Value
-from wd_tagger_append.augmentations import AugmentationConfig
-from wd_tagger_append.constants import CUSTOM_PROCESSOR_FILENAME, DEFAULT_TAGS_FILENAME
+from datasets import Dataset, DatasetDict, concatenate_datasets, load_dataset, load_from_disk
+from wd_tagger_append.augmentation import (
+    BatchItem,
+    create_eval_transform,
+    create_mixup_collate_fn,
+    create_train_transform,
+)
 from wd_tagger_append.dataset_utils import (
-    CollatorInputItem,
-    DatasetSource,
-    analyze_new_tags,
-    create_collate_fn,
-    create_label_encoding_function,
+    create_label_mapping,
     create_transform_function,
-    detect_dataset_source,
-    get_image_processor_size,
-    load_dataset_with_origin,
+    save_label_mapping,
 )
-from wd_tagger_append.labels import (
-    ModelLabels,
-    ModelName,
-    get_model_repo_id,
-    labels_to_dataframe,
-    load_labels_from_hub,
-)
-from wd_tagger_append.lora_config import generate_lora_target_modules
-from wd_tagger_append.model_export import (
-    configure_model_for_remote,
-    copy_custom_processor_code,
-)
-from wd_tagger_append.training import (
-    ConsistencyConfig,
-    ConsistencyTrainer,
-    build_teacher_model,
-)
+from wd_tagger_append.infer import MODEL_REPO_MAP, load_labels_hf
+from wd_tagger_append.metrics import DEFAULT_THRESHOLD, create_compute_metrics_fn
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable, Sequence
+
+app = typer.Typer(help="Fine-tune WD tagger backbones with LoRA adapters.")
 
 
-@dataclass(slots=True)
-class ModelInitializationArtifacts:
-    """Container for model and head initialization tensors."""
+@dataclass
+class DatasetSplits:
+    """Container for train and validation splits."""
 
-    model: AutoModelForImageClassification
-    original_weight: torch.Tensor
-    original_bias: torch.Tensor
-    new_weight_rows: torch.Tensor
-    new_bias_values: torch.Tensor
+    train: Dataset
+    eval: Dataset | None
 
 
-def _load_and_validate_dataset(
-    dataset_source: str,
+def _raise_bad_parameter(message: str, cause: Exception | None = None) -> NoReturn:
+    """Raise BadParameter with pyright-friendly typing."""
+    error = cast("Exception", BadParameter(message))
+    if cause is not None:
+        error.__cause__ = cause
+    raise error  # pyright: ignore[reportGeneralTypeIssues]
+
+
+def _validate_dataset_inputs(dataset_path: Path | None, dataset_name: str | None) -> None:
+    """Ensure exactly one dataset source is provided."""
+    if dataset_path is None and dataset_name is None:
+        msg = "Provide either --dataset-path or --dataset-name."
+        _raise_bad_parameter(msg)  # pyright: ignore[reportGeneralTypeIssues]
+    if dataset_path is not None and dataset_name is not None:
+        msg = "Use only one of --dataset-path or --dataset-name."
+        _raise_bad_parameter(msg)  # pyright: ignore[reportGeneralTypeIssues]
+
+
+def _load_dataset_from_source(
+    dataset_path: Path | None,
+    dataset_name: str | None,
+    dataset_config: str | None,
     token: str | None,
-) -> tuple[DatasetSource, Dataset]:
-    """Load dataset and report its origin."""
-    dataset_origin = detect_dataset_source(dataset_source)
-    if dataset_origin is DatasetSource.LOCAL:
-        typer.echo(f"Loading dataset from local folder: {dataset_source}")
-    else:
-        typer.echo(f"Loading dataset from Hugging Face Hub: {dataset_source}")
-    _, dataset = load_dataset_with_origin(
-        dataset_source,
-        token=token,
-        source=dataset_origin,
-    )
-    typer.echo(f"Loaded {len(dataset)} images")
-    return dataset_origin, dataset
+) -> Dataset | DatasetDict:
+    """Load dataset from disk or the Hugging Face Hub."""
+    if dataset_path is not None:
+        typer.echo(f"Loading dataset from disk: {dataset_path}")
+        return cast("Dataset | DatasetDict", load_from_disk(str(dataset_path)))
 
+    if dataset_name is None:
+        msg = "Dataset name must be provided when dataset path is not used."
+        _raise_bad_parameter(msg)  # pyright: ignore[reportGeneralTypeIssues]
 
-def _analyze_and_extend_labels(
-    dataset: Dataset,
-    model_repo_id: str,
-    token: str | None,
-) -> tuple[ModelLabels, ModelLabels, set[str], set[str]]:
-    """Analyse dataset tags and extend pretrained labels."""
-    typer.echo("Loading pretrained labels...")
-    pretrained_labels = load_labels_from_hub(repo_id=model_repo_id, token=token)
-    typer.echo(f"Pretrained labels: {pretrained_labels.num_labels}")
-
-    typer.echo("Analyzing new tags in dataset...")
-    new_general_tags, new_character_tags = analyze_new_tags(dataset, pretrained_labels)
-    typer.echo(f"Found {len(new_general_tags)} new general tags")
-    typer.echo(f"Found {len(new_character_tags)} new character tags")
-    typer.echo(f"Total new classes: {len(new_general_tags) + len(new_character_tags)}")
-
-    extended_labels = pretrained_labels.extend_with_new_tags(
-        new_general_tags,
-        new_character_tags,
-    )
-    typer.echo(f"Total labels after extension: {extended_labels.num_labels}")
-    return pretrained_labels, extended_labels, new_general_tags, new_character_tags
-
-
-def _vectorize_dataset_labels(
-    dataset: Dataset,
-    extended_labels: ModelLabels,
-) -> Dataset:
-    """Encode label vectors once and prune unused columns."""
-    typer.echo("Vectorizing labels once via dataset caching...")
-    label_encoding_fn = create_label_encoding_function(extended_labels)
-    updated_features = dataset.features.copy()
-    updated_features["labels"] = DatasetSequence(Value("bool"))
-    vectorized = dataset.map(
-        label_encoding_fn,
-        batched=True,
-        features=updated_features,
-        desc="Encoding label vectors",
-        load_from_cache_file=True,
-    )
-    removable_columns = [
-        column
-        for column in ("tags_general", "tags_character", "rating")
-        if column in vectorized.column_names
-    ]
-    if removable_columns:
-        vectorized = vectorized.remove_columns(removable_columns)
-    if "labels" not in vectorized.column_names:
-        msg = "Label vectorization failed to produce a 'labels' column."
-        raise RuntimeError(msg)
-    return vectorized
-
-
-def _initialize_model_with_extended_head(
-    model_repo_id: str,
-    extended_labels: ModelLabels,
-    num_new_classes: int,
-) -> ModelInitializationArtifacts:
-    """Load base model and resize classification head for new labels."""
-    typer.echo("Loading pretrained model...")
-    original_model = AutoModelForImageClassification.from_pretrained(model_repo_id)
-
-    num_original_labels = original_model.config.num_labels
-    original_weight = original_model.timm_model.head.weight.data
-    original_bias = original_model.timm_model.head.bias.data
-
-    weight_std = torch.std(original_weight)
-    bias_std = torch.std(original_bias)
-    new_weight_rows = torch.randn(num_new_classes, original_weight.size(1)) * weight_std
-    new_bias_values = torch.randn(num_new_classes) * bias_std
-
-    typer.echo(f"Creating model with {num_original_labels + num_new_classes} classes...")
-    label2id, id2label = extended_labels.to_label_mappings()
-    model = AutoModelForImageClassification.from_pretrained(
-        model_repo_id,
-        num_labels=num_original_labels + num_new_classes,
-        label2id=label2id,
-        id2label=id2label,
-        ignore_mismatched_sizes=True,
-    )
-    configure_model_for_remote(model)
-
-    expanded_weight = torch.cat([original_weight, new_weight_rows], dim=0)
-    expanded_bias = torch.cat([original_bias, new_bias_values], dim=0)
-    model.timm_model.head.weight.data = expanded_weight.clone()
-    model.timm_model.head.bias.data = expanded_bias.clone()
-
-    return ModelInitializationArtifacts(
-        model=model,
-        original_weight=original_weight,
-        original_bias=original_bias,
-        new_weight_rows=new_weight_rows,
-        new_bias_values=new_bias_values,
-    )
-
-
-def _create_peft_model_with_lora(
-    model: AutoModelForImageClassification,
-    model_name: ModelName,
-    *,
-    lora_r: int,
-    lora_alpha: int,
-    lora_dropout: float,
-    lora_start_block: int,
-    lora_end_block: int,
-) -> PeftModel:
-    """Create a PEFT model configured with LoRA adapters."""
-    typer.echo("Setting up LoRA...")
+    typer.echo(f"Loading dataset from Hugging Face Hub: {dataset_name}")
     try:
-        lora_target_modules = generate_lora_target_modules(
-            model_name=model_name,
-            start_block=lora_start_block,
-            end_block=lora_end_block,
-        )
-    except ValueError as error:
-        raise typer.BadParameter(str(error)) from error
+        dataset = load_dataset(path=dataset_name, name=dataset_config, token=token)
+        return cast("Dataset | DatasetDict", dataset)
+    except HfHubHTTPError as exc:
+        msg = f"Failed to download dataset {dataset_name} (config={dataset_config})"
+        _raise_bad_parameter(msg, cause=exc)  # pyright: ignore[reportGeneralTypeIssues]
 
-    lora_config = LoraConfig(
-        r=lora_r,
-        lora_alpha=lora_alpha,
-        target_modules=lora_target_modules,
-        lora_dropout=lora_dropout,
-        modules_to_save=["head"],
+
+def _select_dataset_splits(
+    dataset: Dataset | DatasetDict,
+    train_split: str,
+    eval_split: str | None,
+) -> DatasetSplits:
+    """Select train and evaluation splits."""
+    if isinstance(dataset, DatasetDict):
+        if train_split not in dataset:
+            msg = (
+                f"Train split '{train_split}' not present in dataset. "
+                f"Available: {list(dataset.keys())}"
+            )
+            _raise_bad_parameter(msg)  # pyright: ignore[reportGeneralTypeIssues]
+        train_ds = dataset[train_split]
+        eval_ds = None
+        if eval_split is not None:
+            if eval_split not in dataset:
+                msg = (
+                    f"Eval split '{eval_split}' not present in dataset. "
+                    f"Available: {list(dataset.keys())}"
+                )
+                _raise_bad_parameter(msg)  # pyright: ignore[reportGeneralTypeIssues]
+            eval_ds = dataset[eval_split]
+        return DatasetSplits(train=train_ds, eval=eval_ds)
+
+    typer.echo(
+        "Dataset is single-split. Using it as the training set; evaluation will be skipped.",
+        err=True,
     )
-    base_model = cast("PreTrainedModel", model)
-    peft_model = cast("PeftModel", get_peft_model(base_model, lora_config))
-    peft_model.print_trainable_parameters()
-    return peft_model
+    return DatasetSplits(train=dataset, eval=None)
 
 
-def _build_teacher_model_if_needed(
-    *,
-    consistency_weight: float,
-    model_repo_id: str,
-    extended_labels: ModelLabels,
-    artifacts: ModelInitializationArtifacts,
-) -> PreTrainedModel | None:
-    """Create a frozen teacher model when consistency regularisation is enabled."""
-    if consistency_weight <= 0.0:
-        typer.echo("Consistency loss disabled (teacher model not created).")
+def _merge_label_lists(
+    base_labels: Sequence[str],
+    dataset_labels: Iterable[str],
+) -> list[str]:
+    """Merge base labels with dataset-specific labels preserving base order."""
+    base_set = set(base_labels)
+    merged = list(base_labels)
+    new_labels = sorted(label for label in dataset_labels if label not in base_set)
+    merged.extend(new_labels)
+    return merged
+
+
+def _wrap_transform(transform: Callable, label_mapping: dict[str, int]) -> Callable:
+    """Wrap dataset transform to drop unused metadata columns."""
+    base_transform = create_transform_function(transform, label_mapping)
+
+    def _transform(examples: dict) -> dict:
+        processed = base_transform(examples)
+        for column in ["tags", "rating", "score", "source", "md5"]:
+            processed.pop(column, None)
+        return processed
+
+    return _transform
+
+
+def _resolve_classifier_module(model: AutoModelForImageClassification) -> tuple[nn.Linear, str]:
+    """Return classifier module and its dotted path."""
+    head = model.timm_model.head  # type: ignore[union-attr]
+    base_path = "timm_model.head"
+    if hasattr(head, "fc"):
+        if isinstance(head.fc, nn.Linear):  # type: ignore[attr-defined]
+            return head.fc, f"{base_path}.fc"
+        msg = f"Classifier head fc is not Linear: {type(head.fc)}"  # type: ignore[attr-defined]
+        raise ValueError(msg)
+    if isinstance(head, nn.Linear):
+        return head, base_path
+    msg = f"Unsupported classifier module type: {type(head)}"
+    raise ValueError(msg)
+
+
+def _expand_classification_head(
+    model: AutoModelForImageClassification,
+    base_labels: Sequence[str],
+    target_labels: Sequence[str],
+    dtype: torch.dtype | None,
+) -> None:
+    """Expand classification head to match target labels, copying known weights."""
+    classifier, classifier_path = _resolve_classifier_module(model)
+    in_features = classifier.in_features  # type: ignore[assignment]
+    old_out_features = classifier.out_features  # type: ignore[assignment]
+    new_out_features = len(target_labels)
+    if old_out_features == new_out_features:
+        typer.echo("Classification head already matches target label count.")
+        return
+
+    typer.echo(
+        f"Expanding classification head ({classifier_path}) from "
+        f"{old_out_features} -> {new_out_features} outputs.",
+    )
+
+    device = classifier.weight.device  # type: ignore[assignment]
+    use_bias = classifier.bias is not None  # type: ignore[assignment]
+    new_head = nn.Linear(in_features, new_out_features, bias=use_bias)
+
+    if dtype is not None:
+        new_head = new_head.to(dtype=dtype)
+    new_head = new_head.to(device)
+
+    base_index = {label: idx for idx, label in enumerate(base_labels)}
+    with torch.no_grad():
+        for target_idx, label in enumerate(target_labels):
+            if label in base_index and base_index[label] < old_out_features:
+                source_idx = base_index[label]
+                new_head.weight[target_idx].copy_(classifier.weight[source_idx])  # type: ignore[index]
+                if use_bias:
+                    new_head.bias[target_idx].copy_(classifier.bias[source_idx])  # type: ignore[index]
+            else:
+                nn.init.normal_(new_head.weight[target_idx], mean=0.0, std=0.02)
+                if use_bias:
+                    nn.init.zeros_(new_head.bias[target_idx])
+
+    head = model.timm_model.head  # type: ignore[union-attr]
+    if hasattr(head, "fc"):
+        head.fc = new_head
+    else:
+        model.timm_model.head = new_head  # type: ignore[assignment]
+
+
+def _create_quantization_config(
+    load_in_4bit: bool,
+    load_in_8bit: bool,
+    compute_dtype: torch.dtype | None,
+) -> BitsAndBytesConfig | None:
+    """Create BitsAndBytes quantization config when requested."""
+    if not load_in_4bit and not load_in_8bit:
         return None
-
-    typer.echo("Building frozen teacher model for consistency regularisation...")
-    return build_teacher_model(
-        model_repo_id=model_repo_id,
-        extended_labels=extended_labels,
-        original_weight=artifacts.original_weight.detach().clone(),
-        original_bias=artifacts.original_bias.detach().clone(),
-        new_weight_rows=artifacts.new_weight_rows.detach().clone(),
-        new_bias_values=artifacts.new_bias_values.detach().clone(),
-    )
-
-
-def _determine_output_directory(
-    *,
-    huggingface_account: str | None,
-    push_to_hub: bool,
-    model_repo_id: str,
-    output_dir: str,
-) -> tuple[str, str | None]:
-    """Resolve output directory and Hub repo ID.
-
-    Returns:
-        Tuple of (local_output_dir, hub_repo_id).
-        hub_repo_id is None when push_to_hub is False.
-    """
-    if push_to_hub:
-        # For Hub upload, we use a temporary local directory
-        # and determine the Hub repo ID
-        local_dir = output_dir
-        if huggingface_account:
-            hub_repo = f"{huggingface_account}/{model_repo_id.split('/')[-1]}"
-        else:
-            # Use partial repo name; push_to_hub will auto-complete username
-            hub_repo = model_repo_id.split("/")[-1]
-            typer.echo(
-                f"Hub repository will be auto-completed from partial name: {hub_repo}",
-            )
-        typer.echo(f"Local output directory: {local_dir}")
-        typer.echo(f"Hub repository: {hub_repo}")
-        return local_dir, hub_repo
-    # Local-only mode
-    typer.echo(f"Output directory (local only): {output_dir}")
-    return output_dir, None
+    if load_in_4bit and load_in_8bit:
+        msg = "Choose only one of --load-in-4bit or --load-in-8bit."
+        _raise_bad_parameter(msg)  # pyright: ignore[reportGeneralTypeIssues]
+    kwargs: dict[str, Any] = {
+        "load_in_4bit": load_in_4bit,
+        "load_in_8bit": load_in_8bit,
+    }
+    if load_in_4bit:
+        kwargs["bnb_4bit_use_double_quant"] = True
+        kwargs["bnb_4bit_quant_type"] = "nf4"
+        if compute_dtype is not None:
+            kwargs["bnb_4bit_compute_dtype"] = compute_dtype
+    return BitsAndBytesConfig(**kwargs)
 
 
-def _validate_mixup_params(mixup: bool, mixup_alpha: float) -> None:
-    """Validate MixUp configuration parameters."""
-    if mixup and mixup_alpha <= 0:
-        msg = "mixup-alpha must be positive when MixUp is enabled"
-        raise typer.BadParameter(msg)
+def _parse_precision(precision: str | None) -> tuple[bool, bool, torch.dtype | None]:
+    """Parse precision flag into trainer arguments and dtype."""
+    if precision is None or precision.lower() == "fp32":
+        return False, False, None
+    if precision.lower() == "bf16":
+        return True, False, torch.bfloat16
+    if precision.lower() == "fp16":
+        return False, True, torch.float16
+    msg = "Precision must be one of: fp32, bf16, fp16."
+    _raise_bad_parameter(msg)  # pyright: ignore[reportGeneralTypeIssues]
 
 
-def _build_augmentation_configs(
-    *,
-    image_size: tuple[int, int],
-    random_flip: bool,
-    flip_prob: float,
-    random_crop: bool,
-    random_crop_min_scale: float,
-    random_crop_max_scale: float,
-    random_rotation: bool,
-    max_rotation_degrees: float,
-    cutout: bool,
-    cutout_prob: float,
-    cutout_min_ratio: float,
-    cutout_max_ratio: float,
-) -> tuple[AugmentationConfig, AugmentationConfig]:
-    """Create training and evaluation augmentation configurations."""
-    if random_crop_min_scale > random_crop_max_scale:
-        msg = "random-crop-min-scale must be <= random-crop-max-scale"
-        raise typer.BadParameter(msg)
-    if cutout_min_ratio > cutout_max_ratio:
-        msg = "cutout-min-ratio must be <= cutout-max-ratio"
-        raise typer.BadParameter(msg)
+def _create_data_collator(num_labels: int, mixup_alpha: float) -> Callable:
+    """Create data collator for Trainer."""
+    if mixup_alpha > 0:
+        mixup_fn = create_mixup_collate_fn(num_classes=num_labels, alpha=mixup_alpha)
 
-    augmentation_config = AugmentationConfig(
-        size=image_size,
-        apply_flip=random_flip,
-        flip_prob=flip_prob,
-        apply_random_crop=random_crop,
-        random_crop_min_scale=random_crop_min_scale,
-        random_crop_max_scale=random_crop_max_scale,
-        apply_rotation=random_rotation,
-        max_rotation_degrees=max_rotation_degrees,
-        apply_cutout=cutout,
-        cutout_prob=cutout_prob,
-        cutout_min_ratio=cutout_min_ratio,
-        cutout_max_ratio=cutout_max_ratio,
-        random_interpolation=True,
-    )
-    return augmentation_config, augmentation_config.evaluation_variant()
+        def collator(batch: list[BatchItem]) -> dict[str, Tensor]:
+            pixel_values, labels = mixup_fn(batch)
+            return {"pixel_values": pixel_values, "labels": labels}
 
+        return collator
 
-def _log_augmentation_config(
-    config: AugmentationConfig,
-    *,
-    mixup: bool,
-    mixup_alpha: float,
-    mixup_prob: float,
-) -> None:
-    """Log augmentation configuration details."""
-    typer.echo("Augmentations configured:")
-    typer.echo(
-        f"  flip={config.apply_flip} (p={config.flip_prob:.2f})",
-    )
-    typer.echo(
-        "  crop="
-        f"{config.apply_random_crop} "
-        f"(scale={config.random_crop_min_scale:.3f}"
-        f"-{config.random_crop_max_scale:.3f})",
-    )
-    typer.echo(
-        f"  rotation={config.apply_rotation} (±{config.max_rotation_degrees:.1f}°)",
-    )
-    typer.echo(
-        "  cutout="
-        f"{config.apply_cutout} "
-        f"(p={config.cutout_prob:.2f}, "
-        f"ratio={config.cutout_min_ratio:.2f}"
-        f"-{config.cutout_max_ratio:.2f})",
-    )
-
-    mixup_alpha_value = mixup_alpha if mixup else 0.0
-    typer.echo(
-        f"  mixup={mixup} (alpha={mixup_alpha_value:.3f}, p={mixup_prob:.2f})",
-    )
-
-
-def _prepare_datasets_with_transforms(
-    dataset: Dataset,
-    *,
-    seed: int,
-    test_size: float,
-    labels: ModelLabels,
-    image_processor: TimmWrapperImageProcessor,
-    train_config: AugmentationConfig,
-    eval_config: AugmentationConfig,
-    mixup: bool,
-    mixup_alpha: float,
-    mixup_prob: float,
-) -> tuple[Dataset, Dataset, Callable[[list[CollatorInputItem]], dict[str, torch.Tensor]]]:
-    """Split dataset, apply transforms, and create collate function."""
-    typer.echo("Splitting dataset...")
-    train_val_split = dataset.train_test_split(test_size=test_size, seed=seed)
-    train_dataset = train_val_split["train"]
-    val_dataset = train_val_split["test"]
-
-    train_transform_fn = create_transform_function(
-        labels,
-        image_processor,
-        config=train_config,
-    )
-    val_transform_fn = create_transform_function(
-        labels,
-        image_processor,
-        config=eval_config,
-    )
-    train_dataset.set_transform(train_transform_fn)
-    val_dataset.set_transform(val_transform_fn)
-
-    collator = create_collate_fn(
-        mixup_alpha=mixup_alpha if mixup else None,
-        mixup_prob=mixup_prob,
-    )
-    return train_dataset, val_dataset, collator
-
-
-def _merge_and_push_to_hub(
-    *,
-    trainer: ConsistencyTrainer,
-    model_repo_id: str,
-    extended_labels: ModelLabels,
-    artifacts: ModelInitializationArtifacts,
-    image_processor: TimmWrapperImageProcessor,
-    output_dir_path: Path,
-    hub_repo_id: str,
-    token: str | None,
-    training_args: TrainingArguments,
-) -> None:
-    """Merge LoRA adapters and upload the resulting model to the Hub."""
-    typer.echo("Merging adapter and preparing for upload...")
-    best_checkpoint_path = trainer.state.best_model_checkpoint
-    if best_checkpoint_path is None:
-        typer.echo("No best checkpoint found. Cannot merge and upload.", err=True)
-        raise typer.Exit(1)
-
-    typer.echo(f"Loading best adapter from {best_checkpoint_path}")
-
-    label2id, id2label = extended_labels.to_label_mappings()
-    base_model = AutoModelForImageClassification.from_pretrained(
-        model_repo_id,
-        num_labels=extended_labels.num_labels,
-        label2id=label2id,
-        id2label=id2label,
-        ignore_mismatched_sizes=True,
-    )
-
-    base_model.timm_model.head.weight.data = torch.cat(
-        [artifacts.original_weight, artifacts.new_weight_rows],
-        dim=0,
-    )
-    base_model.timm_model.head.bias.data = torch.cat(
-        [artifacts.original_bias, artifacts.new_bias_values],
-        dim=0,
-    )
-
-    merged_model = PeftModel.from_pretrained(base_model, best_checkpoint_path)
-    merged_model = merged_model.merge_and_unload()  # pyright: ignore[reportCallIssue]
-
-    configure_model_for_remote(merged_model)
-
-    typer.echo(f"Saving merged model to {output_dir_path}")
-    merged_model.save_pretrained(output_dir_path)
-    image_processor.save_pretrained(output_dir_path)
-
-    custom_processor_dest = copy_custom_processor_code(output_dir_path)
-    typer.echo(f"Copied custom processor code to {custom_processor_dest}")
-
-    labels_df = labels_to_dataframe(extended_labels)
-    output_csv_path = output_dir_path / DEFAULT_TAGS_FILENAME
-    labels_df.to_csv(output_csv_path, index=False)
-    typer.echo(f"Extended labels saved to {output_csv_path}")
-
-    typer.echo(f"Uploading final model to {hub_repo_id}...")
-
-    # Use push_to_hub for the model and processor (high-level API)
-    typer.echo("Pushing model to Hub...")
-    merged_model.push_to_hub(
-        repo_id=hub_repo_id,
-        token=token,
-        commit_message="Upload merged model after training",
-    )
-
-    typer.echo("Pushing processor to Hub...")
-    image_processor.push_to_hub(
-        repo_id=hub_repo_id,
-        token=token,
-        commit_message="Upload image processor",
-    )
-    api = HfApi(token=token)
-
-    # Upload custom processing code and labels CSV
-    custom_files_to_upload = [
-        (CUSTOM_PROCESSOR_FILENAME, CUSTOM_PROCESSOR_FILENAME),
-        (output_csv_path.name, DEFAULT_TAGS_FILENAME),
-    ]
-
-    for local_name, repo_path in custom_files_to_upload:
-        local_file = output_dir_path / local_name
-        if local_file.exists():
-            typer.echo(f"Uploading {local_name} to {repo_path}...")
-            api.upload_file(
-                path_or_fileobj=str(local_file),
-                path_in_repo=repo_path,
-                repo_id=hub_repo_id,
-                token=token,
-                repo_type="model",
-                commit_message=f"Add {local_name}",
-            )
-
-    typer.echo(f"Successfully uploaded merged model to https://huggingface.co/{hub_repo_id}")
-
-
-app = typer.Typer(help="WD Tagger model training tool")
+    return DefaultDataCollator(return_tensors="pt")
 
 
 @app.command()
-def train(
-    dataset_source: Annotated[
-        str,
-        typer.Argument(
-            help=(
-                "Dataset source: either a local folder path or a Hugging Face "
-                "dataset repo ID (e.g., username/dataset-name)"
-            ),
+def main(
+    dataset_path: Annotated[
+        Path | None,
+        typer.Option(
+            "--dataset-path",
+            help="Path to a dataset prepared with wd-tagger-prepare.",
+            exists=True,
+            file_okay=False,
+            dir_okay=True,
+            resolve_path=True,
         ),
-    ],
-    model_name: Annotated[
-        ModelName,
-        typer.Option(help="Model name to use (convnext, eva02-large, swinv2, vit-large, vit)"),
-    ] = "eva02-large",
-    output_dir: Annotated[
-        str,
-        typer.Option(help="Output directory for training results"),
-    ] = "output",
-    huggingface_account: Annotated[
-        str | None,
-        typer.Option(help="Hugging Face account name (used in output path)"),
     ] = None,
-    token: Annotated[
+    dataset_name: Annotated[
         str | None,
-        typer.Option(help="Hugging Face API token (for private datasets)"),
+        typer.Option(
+            "--dataset-name",
+            help="Hugging Face dataset repository to load.",
+        ),
+    ] = None,
+    dataset_config: Annotated[
+        str | None,
+        typer.Option("--dataset-config", help="Optional dataset config name."),
+    ] = None,
+    train_split: Annotated[
+        str,
+        typer.Option("--train-split", help="Split name used for training."),
+    ] = "train",
+    eval_split: Annotated[
+        str | None,
+        typer.Option(
+            "--eval-split",
+            help="Split name used for evaluation. Set to '' to disable.",
+        ),
+    ] = "validation",
+    output_dir: Annotated[
+        Path,
+        typer.Option(
+            "--output-dir",
+            help="Directory to store checkpoints and artifacts.",
+            resolve_path=True,
+        ),
+    ] = Path("output/lora"),
+    model_key: Annotated[
+        str,
+        typer.Option(
+            "--model",
+            case_sensitive=False,
+            help=f"Model key from MODEL_REPO_MAP: {', '.join(MODEL_REPO_MAP.keys())}",
+        ),
+    ] = "eva02-large",
+    base_revision: Annotated[
+        str | None,
+        typer.Option("--base-revision", help="Model revision to load from the Hub."),
+    ] = None,
+    learning_rate: Annotated[
+        float,
+        typer.Option("--learning-rate", min=0.0),
+    ] = 5e-5,
+    num_train_epochs: Annotated[
+        float,
+        typer.Option("--num-epochs", min=0.0),
+    ] = 3.0,
+    train_batch_size: Annotated[
+        int,
+        typer.Option("--train-batch-size", min=1),
+    ] = 8,
+    eval_batch_size: Annotated[
+        int,
+        typer.Option("--eval-batch-size", min=1),
+    ] = 8,
+    gradient_accumulation_steps: Annotated[
+        int,
+        typer.Option("--gradient-accumulation-steps", min=1),
+    ] = 1,
+    weight_decay: Annotated[
+        float,
+        typer.Option("--weight-decay", min=0.0),
+    ] = 0.01,
+    warmup_ratio: Annotated[
+        float,
+        typer.Option("--warmup-ratio", min=0.0, max=1.0),
+    ] = 0.05,
+    lora_rank: Annotated[
+        int,
+        typer.Option("--lora-rank", min=1),
+    ] = 16,
+    lora_alpha: Annotated[
+        int,
+        typer.Option("--lora-alpha", min=1),
+    ] = 32,
+    lora_dropout: Annotated[
+        float,
+        typer.Option("--lora-dropout", min=0.0, max=1.0),
+    ] = 0.05,
+    mixup_alpha: Annotated[
+        float,
+        typer.Option("--mixup-alpha", min=0.0),
+    ] = 0.0,
+    load_in_4bit: Annotated[
+        bool,
+        typer.Option("--load-in-4bit", help="Enable 4-bit quantized loading."),
+    ] = False,
+    load_in_8bit: Annotated[
+        bool,
+        typer.Option("--load-in-8bit", help="Enable 8-bit quantized loading."),
+    ] = False,
+    precision: Annotated[
+        str | None,
+        typer.Option(
+            "--precision",
+            help="Numerical precision: fp32, bf16, or fp16.",
+        ),
+    ] = "bf16",
+    gradient_checkpointing: Annotated[
+        bool,
+        typer.Option("--gradient-checkpointing/--no-gradient-checkpointing"),
+    ] = True,
+    metrics_threshold: Annotated[
+        float,
+        typer.Option("--metrics-threshold", min=0.0, max=1.0),
+    ] = DEFAULT_THRESHOLD,
+    logging_steps: Annotated[
+        int,
+        typer.Option("--logging-steps", min=1),
+    ] = 50,
+    save_strategy: Annotated[
+        Literal["no", "steps", "epoch"],
+        typer.Option(
+            "--save-strategy",
+            help="Checkpoint save strategy.",
+        ),
+    ] = "epoch",
+    save_total_limit: Annotated[
+        int,
+        typer.Option("--save-total-limit", min=1),
+    ] = 2,
+    evaluation_strategy: Annotated[
+        Literal["no", "steps", "epoch"],
+        typer.Option(
+            "--evaluation-strategy",
+            help="Evaluation strategy for Trainer.",
+        ),
+    ] = "epoch",
+    seed: Annotated[
+        int,
+        typer.Option("--seed"),
+    ] = 42,
+    resume_from_checkpoint: Annotated[
+        str | None,
+        typer.Option("--resume-from-checkpoint", help="Path or Hub checkpoint to resume from."),
+    ] = None,
+    report_to: Annotated[
+        list[str] | None,
+        typer.Option("--report-to", help="Reporting integrations (e.g. wandb)."),
     ] = None,
     push_to_hub: Annotated[
         bool,
-        typer.Option(help="Push the model to the Hugging Face Hub after training"),
+        typer.Option("--push-to-hub", help="Push trained adapters to the Hugging Face Hub."),
     ] = False,
-    batch_size: Annotated[int, typer.Option(help="Batch size")] = 4,
-    gradient_accumulation_steps: Annotated[
-        int,
-        typer.Option(help="Gradient accumulation steps"),
-    ] = 4,
-    learning_rate: Annotated[float, typer.Option(help="Learning rate")] = 5e-3,
-    num_epochs: Annotated[int, typer.Option(help="Number of epochs")] = 5,
-    lora_r: Annotated[int, typer.Option(help="LoRA rank")] = 16,
-    lora_alpha: Annotated[int, typer.Option(help="LoRA alpha value")] = 16,
-    lora_dropout: Annotated[float, typer.Option(help="LoRA dropout rate")] = 0.05,
-    lora_start_block: Annotated[int, typer.Option(help="Starting block for LoRA application")] = 8,
-    lora_end_block: Annotated[int, typer.Option(help="Ending block for LoRA application")] = 24,
-    test_size: Annotated[float, typer.Option(help="Validation data ratio", min=0.0, max=1.0)] = 0.1,
-    seed: Annotated[int, typer.Option(help="Random seed")] = 42,
-    random_flip: Annotated[
-        bool,
-        typer.Option(
-            "--random-flip/--no-random-flip",
-            help="Apply random horizontal flips during training",
-        ),
-    ] = True,
-    flip_prob: Annotated[
-        float,
-        typer.Option(help="Probability of applying a horizontal flip", min=0.0, max=1.0),
-    ] = 0.5,
-    random_crop: Annotated[
-        bool,
-        typer.Option(
-            "--random-crop/--no-random-crop",
-            help="Apply random square crops before resizing",
-        ),
-    ] = True,
-    random_crop_min_scale: Annotated[
-        float,
-        typer.Option(
-            help="Minimum retained area fraction for random crop",
-            min=0.0,
-            max=1.0,
-        ),
-    ] = 0.87,
-    random_crop_max_scale: Annotated[
-        float,
-        typer.Option(
-            help="Maximum retained area fraction for random crop",
-            min=0.0,
-            max=1.0,
-        ),
-    ] = 0.998,
-    random_rotation: Annotated[
-        bool,
-        typer.Option(
-            "--random-rotation/--no-random-rotation",
-            help="Apply random rotations to images",
-        ),
-    ] = True,
-    max_rotation_degrees: Annotated[
-        float,
-        typer.Option(help="Maximum absolute degrees for random rotation"),
-    ] = 45.0,
-    cutout: Annotated[
-        bool,
-        typer.Option(
-            "--cutout/--no-cutout",
-            help="Apply random cutout masking to images",
-        ),
-    ] = True,
-    cutout_prob: Annotated[
-        float,
-        typer.Option(help="Probability of applying cutout", min=0.0, max=1.0),
-    ] = 0.5,
-    cutout_min_ratio: Annotated[
-        float,
-        typer.Option(
-            help="Minimum cutout size as a fraction of image size",
-            min=0.0,
-            max=1.0,
-        ),
-    ] = 0.05,
-    cutout_max_ratio: Annotated[
-        float,
-        typer.Option(
-            help="Maximum cutout size as a fraction of image size",
-            min=0.0,
-            max=1.0,
-        ),
-    ] = 0.35,
-    mixup: Annotated[
-        bool,
-        typer.Option("--mixup/--no-mixup", help="Apply MixUp augmentation on mini-batches"),
-    ] = True,
-    mixup_alpha: Annotated[
-        float,
-        typer.Option(help="Alpha parameter for the MixUp beta distribution", min=0.0),
-    ] = 0.4,
-    mixup_prob: Annotated[
-        float,
-        typer.Option(help="Probability of applying MixUp to a batch", min=0.0, max=1.0),
-    ] = 1.0,
-    consistency_weight: Annotated[
-        float,
-        typer.Option(
-            help="Weight applied to the teacher consistency KL penalty (0 disables the feature)",
-            min=0.0,
-        ),
-    ] = 0.2,
-    consistency_warmup_ratio: Annotated[
-        float,
-        typer.Option(
-            help="Fraction of total steps reserved to warm up the consistency penalty",
-            min=0.0,
-            max=1.0,
-        ),
-    ] = 0.0,
+    hub_model_id: Annotated[
+        str | None,
+        typer.Option("--hub-model-id", help="Hub repo id to push to."),
+    ] = None,
+    hub_token: Annotated[
+        str | None,
+        typer.Option("--hub-token", help="Token for private Hub repos or datasets."),
+    ] = None,
 ) -> None:
-    """Execute model training."""
-    model_repo_id = get_model_repo_id(model_name)
-    typer.echo(f"Using model: {model_repo_id}")
+    """Run LoRA fine-tuning."""
+    _validate_dataset_inputs(dataset_path, dataset_name)
 
-    _, dataset = _load_and_validate_dataset(dataset_source, token)
+    repo_id = MODEL_REPO_MAP.get(model_key.lower())
+    if repo_id is None:
+        typer.echo(
+            f"Unknown model key '{model_key}'. Options: {', '.join(MODEL_REPO_MAP.keys())}",
+            err=True,
+        )
+        raise typer.Exit(code=1)
 
-    (
-        _,
-        extended_labels,
-        new_general_tags,
-        new_character_tags,
-    ) = _analyze_and_extend_labels(dataset, model_repo_id, token)
-    dataset = _vectorize_dataset_labels(dataset, extended_labels)
+    raw_dataset = _load_dataset_from_source(dataset_path, dataset_name, dataset_config, hub_token)
+    eval_key = eval_split or None
+    splits = _select_dataset_splits(raw_dataset, train_split=train_split, eval_split=eval_key)
 
-    num_new_classes = len(new_general_tags) + len(new_character_tags)
+    typer.echo(f"Training examples: {len(splits.train)}")
+    if splits.eval is not None:
+        typer.echo(f"Evaluation examples: {len(splits.eval)}")
 
-    _validate_mixup_params(mixup, mixup_alpha)
-    artifacts = _initialize_model_with_extended_head(
-        model_repo_id,
-        extended_labels,
-        num_new_classes,
+    datasets_for_labels: list[Dataset] = [splits.train]
+    if splits.eval is not None:
+        datasets_for_labels.append(splits.eval)
+        combined = concatenate_datasets(datasets_for_labels)
+    else:
+        combined = splits.train
+
+    dataset_label_mapping = create_label_mapping(combined)
+    base_labels = load_labels_hf(repo_id=repo_id, revision=base_revision, token=hub_token).names
+    label_list = _merge_label_lists(base_labels, dataset_label_mapping.keys())
+    label2id = {label: idx for idx, label in enumerate(label_list)}
+    id2label = {idx: label for label, idx in label2id.items()}
+
+    typer.echo(f"Base labels: {len(base_labels)} | Dataset labels: {len(dataset_label_mapping)}")
+    typer.echo(f"Final label space: {len(label_list)} tags")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    label_path = output_dir / "label_mapping.json"
+    save_label_mapping(label2id, label_path)
+    typer.echo(f"Saved label mapping to {label_path}")
+
+    train_transform = create_train_transform(
+        pretrained_model_name_or_path=repo_id,
     )
-    peft_model = _create_peft_model_with_lora(
-        artifacts.model,
-        model_name,
-        lora_r=lora_r,
+    train_dataset = splits.train.with_transform(_wrap_transform(train_transform, label2id))
+    eval_dataset = None
+    if splits.eval is not None:
+        eval_transform = create_eval_transform(pretrained_model_name_or_path=repo_id)
+        eval_dataset = splits.eval.with_transform(_wrap_transform(eval_transform, label2id))
+
+    bf16, fp16, precision_dtype = _parse_precision(precision)
+    quant_config = _create_quantization_config(
+        load_in_4bit=load_in_4bit,
+        load_in_8bit=load_in_8bit,
+        compute_dtype=precision_dtype,
+    )
+
+    typer.echo(f"Loading pretrained model: {repo_id}")
+    model = AutoModelForImageClassification.from_pretrained(
+        repo_id,
+        revision=base_revision,
+        device_map="auto" if quant_config is not None else None,
+        quantization_config=quant_config,
+        torch_dtype=precision_dtype,
+    )
+    image_processor = AutoImageProcessor.from_pretrained(repo_id, revision=base_revision)
+
+    _expand_classification_head(
+        model=model,
+        base_labels=base_labels,
+        target_labels=label_list,
+        dtype=precision_dtype,
+    )
+    model.config.label2id = label2id
+    model.config.id2label = id2label
+    model.config.num_labels = len(label_list)
+    model.config.problem_type = "multi_label_classification"
+    model.config.use_cache = False
+
+    if quant_config is not None:
+        typer.echo("Preparing model for k-bit training.")
+        model = prepare_model_for_kbit_training(
+            model,
+            use_gradient_checkpointing=gradient_checkpointing,
+        )
+    elif gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+
+    classifier_module_name = _resolve_classifier_module(model)[1]
+    modules_to_save = {classifier_module_name}
+
+    lora_config = LoraConfig(
+        r=lora_rank,
         lora_alpha=lora_alpha,
         lora_dropout=lora_dropout,
-        lora_start_block=lora_start_block,
-        lora_end_block=lora_end_block,
+        target_modules="all-linear",
+        task_type=TaskType.SEQ_CLS,
+        modules_to_save=sorted(modules_to_save),
+        bias="none",
     )
-    teacher_model = _build_teacher_model_if_needed(
-        consistency_weight=consistency_weight,
-        model_repo_id=model_repo_id,
-        extended_labels=extended_labels,
-        artifacts=artifacts,
+    model = get_peft_model(model, lora_config)
+    model.print_trainable_parameters()
+
+    data_collator = _create_data_collator(num_labels=len(label_list), mixup_alpha=mixup_alpha)
+    compute_metrics = create_compute_metrics_fn(
+        num_labels=len(label_list),
+        threshold=metrics_threshold,
     )
 
-    local_output_dir, hub_repo_id = _determine_output_directory(
-        huggingface_account=huggingface_account,
-        push_to_hub=push_to_hub,
-        model_repo_id=model_repo_id,
-        output_dir=output_dir,
-    )
-    output_dir_path = Path(local_output_dir)
-    if push_to_hub and hub_repo_id is None:
-        typer.echo("Error: hub_repo_id not set despite push_to_hub=True", err=True)
-        raise typer.Exit(1)
+    trainer_eval_strategy = "no" if eval_dataset is None else evaluation_strategy
 
-    training_args = TrainingArguments(
-        str(output_dir_path),
-        remove_unused_columns=False,
-        eval_strategy="epoch",
-        save_strategy="epoch",
-        learning_rate=learning_rate,
-        per_device_train_batch_size=batch_size,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        per_device_eval_batch_size=batch_size,
-        fp16=True,
-        num_train_epochs=num_epochs,
-        logging_steps=10,
-        load_best_model_at_end=True,
-        label_names=["labels"],
-        push_to_hub=False,
-    )
+    training_args_kwargs: dict[str, Any] = {
+        "output_dir": str(output_dir),
+        "learning_rate": learning_rate,
+        "per_device_train_batch_size": train_batch_size,
+        "per_device_eval_batch_size": eval_batch_size,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+        "num_train_epochs": num_train_epochs,
+        "weight_decay": weight_decay,
+        "warmup_ratio": warmup_ratio,
+        "logging_steps": logging_steps,
+        "evaluation_strategy": trainer_eval_strategy,
+        "save_strategy": save_strategy,
+        "save_total_limit": save_total_limit,
+        "bf16": bf16,
+        "fp16": fp16,
+        "seed": seed,
+        "remove_unused_columns": False,
+        "report_to": report_to,
+        "push_to_hub": push_to_hub,
+        "hub_model_id": hub_model_id,
+        "hub_token": hub_token,
+        "gradient_checkpointing": gradient_checkpointing,
+        "load_best_model_at_end": eval_dataset is not None,
+        "metric_for_best_model": "f1",
+        "greater_is_better": True,
+    }
+    training_args = TrainingArguments(**training_args_kwargs)
 
-    image_processor: TimmWrapperImageProcessor = AutoImageProcessor.from_pretrained(
-        model_repo_id,
-    )
-    image_height, image_width = get_image_processor_size(image_processor)
-    augmentation_config, eval_augmentation_config = _build_augmentation_configs(
-        image_size=(image_height, image_width),
-        random_flip=random_flip,
-        flip_prob=flip_prob,
-        random_crop=random_crop,
-        random_crop_min_scale=random_crop_min_scale,
-        random_crop_max_scale=random_crop_max_scale,
-        random_rotation=random_rotation,
-        max_rotation_degrees=max_rotation_degrees,
-        cutout=cutout,
-        cutout_prob=cutout_prob,
-        cutout_min_ratio=cutout_min_ratio,
-        cutout_max_ratio=cutout_max_ratio,
-    )
-
-    _log_augmentation_config(
-        augmentation_config,
-        mixup=mixup,
-        mixup_alpha=mixup_alpha,
-        mixup_prob=mixup_prob,
-    )
-
-    train_dataset, val_dataset, collator = _prepare_datasets_with_transforms(
-        dataset,
-        seed=seed,
-        test_size=test_size,
-        labels=extended_labels,
-        image_processor=image_processor,
-        train_config=augmentation_config,
-        eval_config=eval_augmentation_config,
-        mixup=mixup,
-        mixup_alpha=mixup_alpha,
-        mixup_prob=mixup_prob,
-    )
-
-    typer.echo("Creating trainer...")
-    consistency_config = ConsistencyConfig(
-        weight=consistency_weight,
-        warmup_ratio=consistency_warmup_ratio,
-        teacher=teacher_model,
-    )
-    trainer = ConsistencyTrainer(
-        consistency=consistency_config,
-        model=peft_model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=val_dataset,
-        processing_class=image_processor,
-        data_collator=collator,
-    )
-
-    typer.echo("Saving extended labels...")
-    output_dir_path.mkdir(parents=True, exist_ok=True)
-    labels_df = labels_to_dataframe(extended_labels)
-    output_csv_path = output_dir_path / DEFAULT_TAGS_FILENAME
-    labels_df.to_csv(output_csv_path, index=False)
-    typer.echo(f"Extended labels saved to {output_csv_path}")
+    trainer_kwargs: dict[str, Any] = {
+        "model": model,
+        "args": training_args,
+        "train_dataset": train_dataset,
+        "eval_dataset": eval_dataset,
+        "data_collator": data_collator,
+        "compute_metrics": compute_metrics if eval_dataset is not None else None,
+        "tokenizer": image_processor,
+    }
+    trainer = Trainer(**trainer_kwargs)
 
     typer.echo("Starting training...")
-    trainer.train()
-    typer.echo("Training completed!")
+    trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+    typer.echo("Training completed. Saving artifacts...")
+
+    trainer.save_model()
+    image_processor.save_pretrained(output_dir)
 
     if push_to_hub:
-        _merge_and_push_to_hub(
-            trainer=trainer,
-            model_repo_id=model_repo_id,
-            extended_labels=extended_labels,
-            artifacts=artifacts,
-            image_processor=image_processor,
-            output_dir_path=output_dir_path,
-            hub_repo_id=hub_repo_id,
-            token=token,
-            training_args=training_args,
-        )
+        typer.echo("Pushing adapters to the Hugging Face Hub...")
+        trainer.push_to_hub()
 
-
-def main() -> None:
-    """Main entry point."""
-    app()
+    typer.echo("All done!")
 
 
 if __name__ == "__main__":
-    main()
+    app()
