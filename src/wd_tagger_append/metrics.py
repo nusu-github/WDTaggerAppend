@@ -31,12 +31,16 @@ def create_compute_metrics_fn(
 ) -> Callable[[EvalPrediction], dict[str, float]]:
     """Create a compute_metrics function for use with Hugging Face Trainer.
 
-    Matches the JAX-CV implementation:
-    - F1: macro-averaged (average across labels)
-    - MCC: macro-averaged (average across labels)
+    All metrics use micro-averaging to handle sparse label distributions:
+    - F1: micro-averaged (global TP/FP/FN across all samples and labels)
+    - MCC: micro-averaged (global confusion matrix)
     - Precision: micro-averaged (global TP/FP across all samples and labels)
     - Recall: micro-averaged (global TP/FN across all samples and labels)
-    - AUROC: macro-averaged (average across labels)
+    - AUROC: weighted-averaged (weighted by label support, micro not available)
+
+    Micro-averaging is preferred for datasets with sparse label distributions
+    where many labels may not appear in the data. Macro-averaging would
+    incorrectly penalize the score by including unused labels.
 
     Args:
         num_labels: Total number of labels in the model
@@ -53,34 +57,34 @@ def create_compute_metrics_fn(
         ...     ...
         ... )
     """
-    # Initialize metrics matching JAX-CV configuration
+    # Initialize metrics with micro-averaging for sparse label datasets
     f1_metric = F1Score(
         task="multilabel",
         num_labels=num_labels,
-        average="macro",  # JAX-CV: macro averaging
+        average="micro",  # Micro averaging for sparse labels
         threshold=threshold,
     )
     mcc_metric = MatthewsCorrCoef(
         task="multilabel",
         num_labels=num_labels,
-        threshold=threshold,  # JAX-CV: macro averaging (torchmetrics default for multilabel)
+        threshold=threshold,  # Micro averaging (torchmetrics default for multilabel)
     )
     precision_metric = Precision(
         task="multilabel",
         num_labels=num_labels,
-        average="micro",  # JAX-CV: micro averaging (changed from macro)
+        average="micro",  # Micro averaging for sparse labels
         threshold=threshold,
     )
     recall_metric = Recall(
         task="multilabel",
         num_labels=num_labels,
-        average="micro",  # JAX-CV: micro averaging (changed from macro)
+        average="micro",  # Micro averaging for sparse labels
         threshold=threshold,
     )
     auroc_metric = AUROC(
         task="multilabel",
         num_labels=num_labels,
-        average="macro",
+        average="weighted",  # Weighted averaging (micro not supported for AUROC)
     )
 
     def compute_metrics(eval_pred: EvalPrediction) -> dict[str, float]:
