@@ -44,7 +44,7 @@ def get_dataset_features() -> Features:
 
 
 def scan_image_folder(folder_path: Path) -> list[tuple[Path, Path]]:
-    """Scan folder for image + JSON pairs.
+    """Scan folder recursively for image + JSON pairs.
 
     Args:
         folder_path: Path to the folder containing images and JSON files.
@@ -62,8 +62,9 @@ def scan_image_folder(folder_path: Path) -> list[tuple[Path, Path]]:
     image_extensions = {".jpg", ".jpeg", ".png", ".webp"}
     pairs = []
 
-    for image_path in folder_path.iterdir():
-        if image_path.suffix.lower() not in image_extensions:
+    # Recursively search for image files using rglob
+    for image_path in folder_path.rglob("*"):
+        if not image_path.is_file() or image_path.suffix.lower() not in image_extensions:
             continue
 
         json_path = image_path.parent / f"{image_path.name}.json"
