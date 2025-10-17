@@ -71,6 +71,11 @@ wd-tagger-prepare = "wd_tagger_append.prepare_dataset:app"
 wd-tagger-infer = "wd_tagger_append.infer:app"
 wd-tagger-train = "wd_tagger_append.train:app"
 
+[project.optional-dependencies]
+schedulefree = [
+    "schedulefree>=1.4.1",
+]
+
 [dependency-groups]
 dev = ["pyright>=1.1.405", "pytest>=8.4.2", "ruff>=0.13.0"]
 

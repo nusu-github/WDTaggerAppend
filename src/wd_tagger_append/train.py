@@ -14,11 +14,11 @@ from torch import Tensor, nn
 from transformers import (
     AutoImageProcessor,
     AutoModelForImageClassification,
-    BitsAndBytesConfig,
     DefaultDataCollator,
     Trainer,
     TrainingArguments,
 )
+from transformers.training_args import OptimizerNames
 from typer import BadParameter
 
 from datasets import Dataset, DatasetDict, concatenate_datasets, load_dataset, load_from_disk
@@ -216,29 +216,6 @@ def _expand_classification_head(
         head.fc = new_head
     else:
         model.timm_model.head = new_head  # type: ignore[assignment]
-
-
-def _create_quantization_config(
-    load_in_4bit: bool,
-    load_in_8bit: bool,
-    compute_dtype: torch.dtype | None,
-) -> BitsAndBytesConfig | None:
-    """Create BitsAndBytes quantization config when requested."""
-    if not load_in_4bit and not load_in_8bit:
-        return None
-    if load_in_4bit and load_in_8bit:
-        msg = "Choose only one of --load-in-4bit or --load-in-8bit."
-        _raise_bad_parameter(msg)  # pyright: ignore[reportGeneralTypeIssues]
-    kwargs: dict[str, Any] = {
-        "load_in_4bit": load_in_4bit,
-        "load_in_8bit": load_in_8bit,
-    }
-    if load_in_4bit:
-        kwargs["bnb_4bit_use_double_quant"] = True
-        kwargs["bnb_4bit_quant_type"] = "nf4"
-        if compute_dtype is not None:
-            kwargs["bnb_4bit_compute_dtype"] = compute_dtype
-    return BitsAndBytesConfig(**kwargs)
 
 
 def _parse_precision(precision: str | None) -> tuple[bool, bool, torch.dtype | None]:
@@ -538,9 +515,13 @@ def main(
         typer.Option("--label-smoothing-factor", min=0.0, max=1.0),
     ] = 0.0,
     optim: Annotated[
-        str,
+        OptimizerNames,
         typer.Option("--optim"),
-    ] = "adamw_torch",
+    ] = OptimizerNames.ADAMW_TORCH,
+    torch_compile: Annotated[
+        bool,
+        typer.Option("--torch-compile/--no-torch-compile"),
+    ] = False,
     seed: Annotated[
         int,
         typer.Option("--seed"),
@@ -813,6 +794,7 @@ def main(
         "dataloader_persistent_workers": dataloader_persistent_workers,
         "label_smoothing_factor": label_smoothing_factor,
         "optim": optim,
+        "torch_compile": torch_compile,
         "seed": seed,
         "remove_unused_columns": False,
         "report_to": report_to,
