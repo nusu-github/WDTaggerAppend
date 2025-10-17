@@ -8,27 +8,19 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated
+from typing import TYPE_CHECKING, Annotated, cast
 
 import typer
 from PIL import Image as PILImage
 
 from datasets import ClassLabel, Dataset, DatasetDict, Features, Image, Sequence, Value
+from wd_tagger_append.dataset_utils import RATING_CODE_TO_NAME
 
 if TYPE_CHECKING:
     from collections.abc import Generator
 
 
 app = typer.Typer(help="Prepare WD Tagger datasets from image folders")
-
-
-# Rating mapping from Danbooru single-letter codes to full names
-RATING_MAP = {
-    "g": "general",
-    "s": "sensitive",
-    "q": "questionable",
-    "e": "explicit",
-}
 
 
 def get_dataset_features() -> Features:
@@ -43,9 +35,9 @@ def get_dataset_features() -> Features:
             "source": Value("string"),
             "image": Image(),
             "tags": {
-                "rating": ClassLabel(names=list(RATING_MAP.values())),
                 "general": Sequence(Value("string")),
                 "character": Sequence(Value("string")),
+                "rating": ClassLabel(names=list(RATING_CODE_TO_NAME.values())),
             },
             "score": Value("int32"),
         },
@@ -158,12 +150,16 @@ def create_dataset_generator(
             # Load image
             image = PILImage.open(image_path)
 
-            # Convert rating
-            rating = RATING_MAP.get(metadata["rating"], "general")
+            # Convert rating code to full name
+            rating = RATING_CODE_TO_NAME.get(metadata["rating"], "general")
+
+            # Add rating to tags dict for consistent structure
+            tags_with_rating = metadata["tags"].copy()
+            tags_with_rating["rating"] = [rating]
 
             yield {
                 "image": image,
-                "tags": metadata["tags"],
+                "tags": tags_with_rating,
                 "rating": rating,
                 "score": metadata["score"],
                 "source": metadata["source"],
@@ -189,10 +185,13 @@ def create_dataset(image_dir: Path) -> Dataset:
     """
     typer.echo("Creating dataset from generator...")
 
-    dataset = Dataset.from_generator(
-        create_dataset_generator,
-        gen_kwargs={"image_dir": image_dir},
-        features=get_dataset_features(),
+    dataset = cast(
+        "Dataset",
+        Dataset.from_generator(
+            create_dataset_generator,
+            gen_kwargs={"image_dir": image_dir},
+            features=get_dataset_features(),
+        ),
     )
 
     typer.echo(f"Dataset created with {len(dataset)} examples")
