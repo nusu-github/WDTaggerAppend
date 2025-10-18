@@ -135,8 +135,14 @@ def count_tag_frequencies(
         return {"extracted_tags": all_tags}
 
     # Use map with batched=True for performance
+    # Reduce batch_size to avoid PyArrow offset overflow with large datasets
     dataset = dataset.cast_column("image", Image(decode=False))
-    processed = dataset.map(extract_tags_batch, batched=True)
+    processed = dataset.map(
+        extract_tags_batch,
+        batched=True,
+        batch_size=100,  # Smaller batch size to prevent offset overflow
+        writer_batch_size=100,  # Control Arrow writer batch size
+    )
 
     # Aggregate frequencies
     for example in processed:
@@ -201,8 +207,14 @@ def determine_tag_categories(
         return {"categorized_tags": categorized_batch}
 
     # Use map with batched=True for performance
+    # Reduce batch_size to avoid PyArrow offset overflow with large datasets
     dataset = dataset.cast_column("image", Image(decode=False))
-    processed = dataset.map(extract_categorized_tags_batch, batched=True)
+    processed = dataset.map(
+        extract_categorized_tags_batch,
+        batched=True,
+        batch_size=100,  # Smaller batch size to prevent offset overflow
+        writer_batch_size=100,  # Control Arrow writer batch size
+    )
 
     # Aggregate with priority (first occurrence wins)
     for example in processed:
