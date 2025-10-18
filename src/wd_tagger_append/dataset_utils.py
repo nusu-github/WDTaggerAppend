@@ -426,7 +426,7 @@ def encode_multi_labels(
         Multi-hot encoded tensor of shape (num_labels,).
     """
     num_classes = len(label_mapping)
-    labels = torch.zeros(num_classes, dtype=torch.uint8)
+    labels = torch.zeros(num_classes, dtype=torch.float32)
 
     def add_tag(tag: str | None) -> None:
         if tag is None:

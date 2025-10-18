@@ -142,23 +142,6 @@ def _merge_label_lists(
     return merged
 
 
-def _wrap_transform(
-    transform: Callable,
-    label_mapping: dict[str, int],
-    categories: Sequence[str],
-) -> Callable:
-    """Wrap dataset transform to drop unused metadata columns."""
-    base_transform = create_transform_function(transform, label_mapping, categories)
-
-    def _transform(examples: dict) -> dict:
-        processed = base_transform(examples)
-        for column in ["tags", "rating", "score", "source", "md5"]:
-            processed.pop(column, None)
-        return processed
-
-    return _transform
-
-
 def _resolve_classifier_module(model: AutoModelForImageClassification) -> tuple[nn.Linear, str]:
     """Return classifier module and its dotted path."""
     head = model.timm_model.head  # type: ignore[union-attr]
@@ -669,7 +652,7 @@ def main(
     # Filter new tags using Pandas-optimized function
     # This replaces multiple dict comprehensions with a single vectorized operation
     filtered_new_tags = filter_tags_pandas(
-        tag_frequencies=new_tags_frequencies, # pyright: ignore[reportArgumentType]
+        tag_frequencies=new_tags_frequencies,  # pyright: ignore[reportArgumentType]
         base_label_set=base_label_set,
         tag_categories=dataset_tag_categories,
         selected_categories=selected_categories,
@@ -724,13 +707,13 @@ def main(
         pretrained_model_name_or_path=repo_id,
     )
     train_dataset = splits.train.with_transform(
-        _wrap_transform(train_transform, label2id, all_categories),
+        create_transform_function(train_transform, label2id, all_categories),
     )
     eval_dataset = None
     if splits.eval is not None:
         eval_transform = create_eval_transform(pretrained_model_name_or_path=repo_id)
         eval_dataset = splits.eval.with_transform(
-            _wrap_transform(eval_transform, label2id, all_categories),
+            create_transform_function(eval_transform, label2id, all_categories),
         )
 
     bf16, fp16, precision_dtype = _parse_precision(precision)
@@ -741,6 +724,7 @@ def main(
         revision=base_revision,
         device_map="auto",
         dtype=precision_dtype,
+        problem_type="multi_label_classification",
     )
     image_processor = AutoImageProcessor.from_pretrained(repo_id, revision=base_revision)
 
@@ -753,8 +737,6 @@ def main(
     model.config.label2id = label2id
     model.config.id2label = id2label
     model.config.num_labels = len(label_list)
-    model.config.problem_type = "multi_label_classification"
-    model.config.use_cache = False
 
     if gradient_checkpointing:
         model.gradient_checkpointing_enable()
@@ -766,14 +748,12 @@ def main(
         r=lora_rank,
         lora_alpha=lora_alpha,
         lora_dropout=lora_dropout,
-        target_modules="all-linear",
+        target_modules=["q_proj", "v_proj", "qkv", "fc1", "fc2"],
         modules_to_save=sorted(modules_to_save),
         bias="none",
     )
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
-
-    model.config.task_type = "multi_label_classification"  # pyright: ignore[reportArgumentType, reportAttributeAccessIssue]
 
     # Register gradient masking hooks if base labels should be frozen
     if freeze_base_labels:
