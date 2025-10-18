@@ -306,13 +306,13 @@ def encode_multi_labels(
 ) -> torch.Tensor:
     """Encode tags as a multi-hot vector respecting category filters."""
     num_classes = len(label_mapping)
-    labels = torch.zeros(num_classes, dtype=torch.float32)
+    labels = torch.zeros(num_classes, dtype=torch.uint8)
 
     def add_tag(tag: str | None) -> None:
         if tag is None:
             return
         if tag in label_mapping:
-            labels[label_mapping[tag]] = 1.0
+            labels[label_mapping[tag]] = 1
 
     if "general" in categories:
         for tag in tags_dict.get("general", []):
