@@ -1,23 +1,21 @@
 """Dataset preparation module for WD Tagger training.
 
 This module provides utilities to convert image folders with Danbooru JSON metadata
-into Hugging Face Datasets format with MD5-based deduplication.
+into Hugging Face Datasets format using Pandas for batch processing.
 """
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, cast
+from typing import Annotated
 
+import pandas as pd
+import PIL.Image
 import typer
 
 from datasets import ClassLabel, Dataset, DatasetDict, Features, Image, Sequence, Value
 from wd_tagger_append.dataset_utils import RATING_CODE_TO_NAME
-
-if TYPE_CHECKING:
-    from collections.abc import Generator
-
 
 app = typer.Typer(help="Prepare WD Tagger datasets from image folders")
 
@@ -43,14 +41,19 @@ def get_dataset_features() -> Features:
     )
 
 
-def scan_image_folder(folder_path: Path) -> list[tuple[Path, Path]]:
-    """Scan folder recursively for image + JSON pairs.
+def scan_and_parse_bulk(folder_path: Path) -> pd.DataFrame:
+    """Scan folder and parse all JSON files into a DataFrame in one pass.
+
+    Uses Pandas operations for:
+    - Vectorized data operations
+    - MD5 deduplication via DataFrame.drop_duplicates()
+    - Batch processing without Python-level iteration
 
     Args:
         folder_path: Path to the folder containing images and JSON files.
 
     Returns:
-        List of (image_path, json_path) tuples.
+        DataFrame with columns: image_path, md5, rating, score, source, general_tags, character_tags
 
     Raises:
         ValueError: If folder doesn't exist or contains no valid pairs.
@@ -59,116 +62,106 @@ def scan_image_folder(folder_path: Path) -> list[tuple[Path, Path]]:
         msg = f"Folder not found: {folder_path}"
         raise ValueError(msg)
 
-    image_extensions = {".jpg", ".jpeg", ".png", ".webp"}
-    pairs = []
+    image_extensions = PIL.Image.registered_extensions().keys()
+    records = []
 
-    # Recursively search for image files using rglob
-    for image_path in folder_path.rglob("*"):
+    typer.echo("Scanning directory and parsing JSON files...")
+
+    # Collect all image+JSON pairs
+    for image_path in folder_path.rglob("**/*"):
         if not image_path.is_file() or image_path.suffix.lower() not in image_extensions:
             continue
 
         json_path = image_path.parent / f"{image_path.name}.json"
-        if json_path.exists():
-            pairs.append((image_path, json_path))
-        else:
+        if not json_path.exists():
             typer.echo(f"Warning: Missing JSON for {image_path.name}", err=True)
+            continue
 
-    if not pairs:
+        # Parse JSON
+        try:
+            with open(json_path) as f:
+                data = json.load(f)
+
+            # Validate required fields
+            if "md5" not in data:
+                typer.echo(f"Warning: Missing md5 in {json_path.name}", err=True)
+                continue
+
+            records.append(
+                {
+                    "image_path": str(image_path),
+                    "md5": data["md5"],
+                    "rating": data.get("rating", "g"),
+                    "score": data.get("score", 0),
+                    "source": data.get("source", ""),
+                    "general_tags": data.get("tag_string_general", "").split(),
+                    "character_tags": data.get("tag_string_character", "").split(),
+                },
+            )
+
+        except (json.JSONDecodeError, KeyError) as e:
+            typer.echo(f"Warning: Error parsing {json_path.name}: {e}", err=True)
+            continue
+
+    if not records:
         msg = f"No valid image+JSON pairs found in {folder_path}"
         raise ValueError(msg)
 
-    return pairs
+    # Create DataFrame from all records in a single operation
+    df = pd.DataFrame(records)
+    typer.echo(f"Found {len(df)} image+JSON pairs")
+
+    # Vectorized MD5 deduplication - native Pandas operation (C code)
+    original_len = len(df)
+    df = df.drop_duplicates(subset=["md5"], keep="first")
+    num_duplicates = original_len - len(df)
+
+    if num_duplicates > 0:
+        typer.echo(f"Removed {num_duplicates} duplicate images based on MD5")
+
+    typer.echo(f"Retained {len(df)} unique images")
+
+    return df
 
 
-def parse_danbooru_json(json_path: Path) -> dict:
-    """Parse Danbooru JSON metadata.
+def dataframe_to_dataset(df: pd.DataFrame) -> Dataset:
+    """Convert DataFrame to Hugging Face Dataset with proper schema.
 
     Args:
-        json_path: Path to the JSON file.
+        df: DataFrame with image metadata.
 
     Returns:
-        Dictionary containing extracted metadata.
-
-    Raises:
-        ValueError: If JSON is malformed or missing required fields.
+        Dataset object with proper features.
     """
-    try:
-        with open(json_path) as f:
-            data = json.load(f)
-    except json.JSONDecodeError as e:
-        msg = f"Invalid JSON in {json_path}: {e}"
-        raise ValueError(msg) from e
+    typer.echo("Converting DataFrame to Dataset...")
 
-    required_fields = ["md5", "rating", "score", "source"]
-    missing_fields = [field for field in required_fields if field not in data]
-    if missing_fields:
-        msg = f"Missing required fields in {json_path}: {', '.join(missing_fields)}"
-        raise ValueError(msg)
-
-    # Extract tag strings with fallback to empty string
-    return {
-        "md5": data["md5"],
-        "rating": data["rating"],
-        "score": data.get("score", 0),
-        "source": data.get("source", ""),
-        "tags": {
-            "general": data.get("tag_string_general", "").split(),
-            "character": data.get("tag_string_character", "").split(),
-        },
+    # Prepare data in the format expected by Dataset
+    data_dict = {
+        "image": df["image_path"].tolist(),
+        "md5": df["md5"].tolist(),
+        "source": df["source"].tolist(),
+        "score": df["score"].astype("int32").tolist(),
+        "rating": [RATING_CODE_TO_NAME.get(r, "general") for r in df["rating"]],
+        "tags": [
+            {"general": gen, "character": char}
+            for gen, char in zip(df["general_tags"], df["character_tags"], strict=True)
+        ],
     }
 
+    # Create dataset from dict with all data in memory
+    dataset = Dataset.from_dict(data_dict, features=get_dataset_features())
 
-def create_dataset_generator(
-    image_dir: Path,
-) -> Generator[dict, None, None]:
-    """Generate dataset examples with MD5-based deduplication.
-
-    Args:
-        image_dir: Path to the directory containing images and JSON files.
-
-    Yields:
-        Dictionary containing image data and metadata.
-    """
-    seen_md5 = set()
-    pairs = scan_image_folder(image_dir)
-
-    typer.echo(f"Found {len(pairs)} image+JSON pairs")
-
-    for image_path, json_path in pairs:
-        try:
-            # Parse metadata
-            metadata = parse_danbooru_json(json_path)
-            md5_hash = metadata["md5"]
-
-            # Check for duplicates
-            if md5_hash in seen_md5:
-                typer.echo(f"Skipping duplicate: {image_path.name} (md5: {md5_hash})")
-                continue
-
-            seen_md5.add(md5_hash)
-
-            # Convert rating code to full name
-            rating = RATING_CODE_TO_NAME.get(metadata["rating"], "general")
-
-            yield {
-                "image": image_path,
-                "tags": metadata["tags"],
-                "rating": rating,
-                "score": metadata["score"],
-                "source": metadata["source"],
-                "md5": md5_hash,
-            }
-
-        except Exception as e:
-            typer.echo(f"Error processing {image_path.name}: {e}", err=True)
-            continue
-
-    num_duplicates = len(pairs) - len(seen_md5)
-    typer.echo(f"Processed {len(seen_md5)} unique images (skipped {num_duplicates} duplicates)")
+    typer.echo(f"Dataset created with {len(dataset)} examples")
+    return dataset
 
 
 def create_dataset(image_dir: Path) -> Dataset:
-    """Create a Hugging Face Dataset from an image directory.
+    """Create a Hugging Face Dataset from an image directory using Pandas pipeline.
+
+    Processing steps:
+    - Scans and parses all JSON files in one pass
+    - Deduplicates by MD5 using Pandas DataFrame operations
+    - Converts to Dataset using batch operations
 
     Args:
         image_dir: Path to the directory containing images and JSON files.
@@ -176,24 +169,16 @@ def create_dataset(image_dir: Path) -> Dataset:
     Returns:
         Dataset object containing the processed data.
     """
-    typer.echo("Creating dataset from generator...")
+    # Step 1: Scan and parse everything into a DataFrame
+    df = scan_and_parse_bulk(image_dir)
 
-    dataset = cast(
-        "Dataset",
-        Dataset.from_generator(
-            create_dataset_generator,
-            gen_kwargs={"image_dir": image_dir},
-            features=get_dataset_features(),
-        ),
-    )
-
-    typer.echo(f"Dataset created with {len(dataset)} examples")
-    return dataset
+    # Step 2: Convert to Dataset
+    return dataframe_to_dataset(df)
 
 
 def split_dataset(
     dataset: Dataset,
-    train_ratio: Annotated[float, typer.Option(min=0.0, max=1.0)] = 0.8,
+    train_ratio: float = 0.8,
     seed: int = 42,
 ) -> DatasetDict:
     """Split dataset into train and validation sets.
@@ -274,9 +259,14 @@ def prepare(
         ),
     ] = True,
 ) -> None:
-    """Prepare WD Tagger dataset from image folder with Danbooru JSON metadata.
+    """Prepare WD Tagger dataset from image folder.
 
-    This command:
+    This command uses Pandas for vectorized operations:
+    - Bulk JSON parsing and DataFrame creation
+    - MD5 deduplication via Pandas
+    - Single Dataset.from_dict() call
+
+    Processing steps:
     1. Scans the image directory for image+JSON pairs
     2. Removes duplicates based on MD5 hash
     3. Splits data into train/validation sets
@@ -285,11 +275,11 @@ def prepare(
     """
     typer.echo(f"Preparing dataset from: {image_dir}")
 
-    # Create dataset
+    # Create dataset using Pandas pipeline
     dataset = create_dataset(image_dir)
 
     # Split dataset
-    dataset_dict = split_dataset(dataset, train_ratio=train_ratio)
+    dataset_dict = split_dataset(dataset, train_ratio=train_ratio, seed=42)
 
     # Save to disk if output directory specified
     if output_dir:

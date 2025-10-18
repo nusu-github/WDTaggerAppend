@@ -30,9 +30,11 @@ from wd_tagger_append.augmentation import (
     create_train_transform,
 )
 from wd_tagger_append.dataset_utils import (
+    categorize_label_list,
     create_label_mapping,
     create_transform_function,
     determine_tag_categories,
+    filter_tags_pandas,
     load_allowed_tags,
     save_labels_as_csv,
 )
@@ -253,13 +255,12 @@ def _parse_precision(precision: str | None) -> tuple[bool, bool, torch.dtype | N
 
 
 def _create_gradient_mask_hook(num_base_labels: int) -> Callable[[Tensor], Tensor]:
-    """Create a gradient hook that zeros out gradients for base model labels.
+    """Create a gradient hook that masks gradients for base model labels.
 
-    This hook preserves base model performance when fine-tuning on domain-specific
-    data with few new labels by preventing updates to the existing label weights.
+    Prevents updates to the existing label weights during fine-tuning.
 
     Args:
-        num_base_labels: Number of base model labels to freeze
+        num_base_labels: Number of base model labels to mask
 
     Returns:
         Hook function that masks gradients for the first num_base_labels indices
@@ -655,28 +656,7 @@ def main(
     # Determine categories for new tags only
     dataset_tag_categories = determine_tag_categories(combined, categories=all_categories)
 
-    # Filter new tags by category
-    filtered_new_tags = {
-        tag: count
-        for tag, count in new_tags_frequencies.items()
-        if dataset_tag_categories.get(tag, "general") in selected_categories
-    }
-
-    typer.echo(
-        f"After category filter ({', '.join(selected_categories)}): "
-        f"{len(filtered_new_tags)} new tags remain",
-    )
-
-    # Apply min_tag_count filter to new tags
-    filtered_new_tags = {
-        tag: count for tag, count in filtered_new_tags.items() if count >= min_tag_count
-    }
-
-    typer.echo(
-        f"After min-count filter (>={min_tag_count}): {len(filtered_new_tags)} new tags remain",
-    )
-
-    # Apply allowed_tags_file filter to new tags
+    # Load allow list if provided
     allow_list: set[str] | None = None
     if allowed_tags_file is not None:
         allow_list = load_allowed_tags(allowed_tags_file)
@@ -686,13 +666,21 @@ def main(
             )
             _raise_bad_parameter(msg)  # pyright: ignore[reportGeneralTypeIssues]
 
-        filtered_new_tags = {
-            tag: count for tag, count in filtered_new_tags.items() if tag in allow_list
-        }
-        typer.echo(
-            f"After allow-list filter: {len(filtered_new_tags)} new tags remain "
-            f"({len(allow_list) - len(filtered_new_tags)} tags from allow-list not found)",
-        )
+    # Filter new tags using Pandas-optimized function
+    # This replaces multiple dict comprehensions with a single vectorized operation
+    filtered_new_tags = filter_tags_pandas(
+        tag_frequencies=new_tags_frequencies, # pyright: ignore[reportArgumentType]
+        base_label_set=base_label_set,
+        tag_categories=dataset_tag_categories,
+        selected_categories=selected_categories,
+        min_count=min_tag_count,
+        allowed_tags=allow_list,
+    )
+
+    typer.echo(
+        f"After filtering (category, min-count, allow-list): "
+        f"{len(filtered_new_tags)} new tags remain",
+    )
 
     # Combine base labels with filtered new tags
     dataset_label_mapping = {**{tag: idx for idx, tag in enumerate(base_labels)}}
@@ -715,38 +703,19 @@ def main(
     # Save labels as CSV (WD Tagger v3 compatible format)
     csv_path = output_dir / "selected_tags.csv"
 
-    # Build category mapping
-    base_general_tags = {base_labels[idx] for idx in base_label_data.general}
-    base_character_tags = {base_labels[idx] for idx in base_label_data.character}
-    base_rating_tags = {base_labels[idx] for idx in base_label_data.rating}
-
-    # Categorize all labels
-    general_tags = []
-    character_tags = []
-    rating_tags = []
-
-    for tag in label_list:
-        if tag in base_rating_tags:
-            rating_tags.append(tag)
-        elif tag in base_character_tags:
-            character_tags.append(tag)
-        elif tag in base_general_tags:
-            general_tags.append(tag)
-        else:
-            # New tags from dataset: use dataset category
-            dataset_category = dataset_tag_categories.get(tag, "general")
-            if dataset_category == "rating":
-                rating_tags.append(tag)
-            elif dataset_category == "character":
-                character_tags.append(tag)
-            else:
-                general_tags.append(tag)
-
-    tag_categories = {
-        "rating": rating_tags,
-        "general": general_tags,
-        "character": character_tags,
+    # Build category mapping for base labels
+    base_label_indices = {
+        "rating": {base_labels[idx] for idx in base_label_data.rating},
+        "character": {base_labels[idx] for idx in base_label_data.character},
+        "general": {base_labels[idx] for idx in base_label_data.general},
     }
+
+    # Categorize all labels using vectorized Pandas operation
+    tag_categories = categorize_label_list(
+        label_list=label_list,
+        base_label_indices=base_label_indices,
+        dataset_tag_categories=dataset_tag_categories,
+    )
 
     save_labels_as_csv(label_list, tag_categories, csv_path)
     typer.echo(f"Saved labels as CSV to {csv_path}")
@@ -803,6 +772,8 @@ def main(
     )
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
+
+    model.config.task_type = "multi_label_classification"  # pyright: ignore[reportArgumentType, reportAttributeAccessIssue]
 
     # Register gradient masking hooks if base labels should be frozen
     if freeze_base_labels:

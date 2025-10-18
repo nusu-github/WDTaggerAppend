@@ -343,7 +343,7 @@ def create_train_transform(
         rotation_degrees: Maximum rotation angle in degrees. Set to 0 to disable.
         cutout_scale: Area proportion range supplied to ``RandomErasing``.
         cutout_ratio: Aspect ratio range supplied to ``RandomErasing``.
-        random_resize_method: Whether to add an additional resize with randomly picked interpolation.
+        random_resize_method: Whether to add an additional resize with random interpolation.
 
     Returns:
         Composed transform pipeline.
@@ -366,7 +366,7 @@ def create_train_transform(
         ),
     ]
 
-    # Add random interpolation resize if enabled (for training robustness)
+    # Add random interpolation resize if enabled
     if random_resize_method:
         transform_steps.append(create_random_interpolation_resize(size=image_size))
 
