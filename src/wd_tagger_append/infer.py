@@ -68,36 +68,24 @@ def _is_local_path(source: str) -> bool:
         return False
 
 
-def _create_quantization_config(
-    load_in_4bit: bool,
-    load_in_8bit: bool,
-    compute_dtype: torch.dtype | None,
-) -> BitsAndBytesConfig | None:
+def _create_quantization_config() -> BitsAndBytesConfig | None:
     """Construct a BitsAndBytes quantization configuration if requested."""
-    if not load_in_4bit and not load_in_8bit:
-        return None
-    if load_in_4bit and load_in_8bit:
-        msg = "Choose only one of --load-in-4bit or --load-in-8bit."
-        raise typer.BadParameter(msg)
-
-    kwargs: dict[str, Any] = {
-        "load_in_4bit": load_in_4bit,
-        "load_in_8bit": load_in_8bit,
-    }
-    if load_in_4bit:
-        kwargs["bnb_4bit_use_double_quant"] = True
-        kwargs["bnb_4bit_quant_type"] = "nf4"
-        if compute_dtype is not None:
-            kwargs["bnb_4bit_compute_dtype"] = compute_dtype
-    return BitsAndBytesConfig(**kwargs)
+    return BitsAndBytesConfig(
+        load_in_8bit=True,
+        llm_int8_skip_modules=["head"],
+    )
 
 
 def _parse_precision(precision: str | None) -> torch.dtype | None:
     """Parse precision flag into torch dtype."""
+    bf16_supported = torch.cuda.is_bf16_supported()
     if precision is None or precision.lower() == "fp32":
         return None
     normalized = precision.lower()
     if normalized == "bf16":
+        if not bf16_supported:
+            msg = "bfloat16 is not supported on this device."
+            raise typer.BadParameter(msg)
         return torch.bfloat16
     if normalized == "fp16":
         return torch.float16
@@ -310,20 +298,13 @@ def main(
         float,
         typer.Option(help="Threshold for character tags"),
     ] = 0.75,
-    load_in_4bit: Annotated[
+    quantization: Annotated[
         bool,
         typer.Option(
-            "--load-in-4bit/--no-load-in-4bit",
-            help="Enable 4-bit NF4 quantized loading (default: enabled).",
+            "--quantization/--no-quantization",
+            help="Enable 8-bit quantization for the model.",
         ),
     ] = True,
-    load_in_8bit: Annotated[
-        bool,
-        typer.Option(
-            "--load-in-8bit/--no-load-in-8bit",
-            help="Enable 8-bit quantized loading (default: disabled).",
-        ),
-    ] = False,
     precision: Annotated[
         str | None,
         typer.Option(
@@ -374,7 +355,7 @@ def main(
     )
 
     precision_dtype = _parse_precision(precision)
-    quantization_config = _create_quantization_config(load_in_4bit, load_in_8bit, precision_dtype)
+    quantization_config = _create_quantization_config()
 
     base_kwargs: dict[str, Any] = {}
     if quantization_config is not None:

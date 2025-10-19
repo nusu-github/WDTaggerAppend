@@ -4,17 +4,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from types import MethodType
 from typing import TYPE_CHECKING, Annotated, Any, Literal, NoReturn, cast
 
 import torch
 import typer
 from huggingface_hub.errors import HfHubHTTPError
-from peft import LoraConfig, PeftModel, get_peft_model
+from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
 from peft.utils import ModulesToSaveWrapper
 from torch import Tensor, nn
 from transformers import (
     AutoImageProcessor,
     AutoModelForImageClassification,
+    BitsAndBytesConfig,
     DefaultDataCollator,
     Trainer,
     TrainingArguments,
@@ -72,6 +74,31 @@ def _validate_dataset_inputs(dataset_path: Path | None, dataset_name: str | None
     if dataset_path is not None and dataset_name is not None:
         msg = "Use only one of --dataset-path or --dataset-name."
         _raise_bad_parameter(msg)  # pyright: ignore[reportGeneralTypeIssues]
+
+
+def _validate_hub_inputs(
+    push_to_hub: bool,
+    hub_model_id: str | None,
+    output_dir: Path,
+) -> None:
+    """Validate Hub-related options.
+
+    When push_to_hub is True:
+    - hub_model_id must be provided
+    - If output_dir exists, it must be a valid git repository clone
+    """
+    if push_to_hub and hub_model_id is None:
+        msg = "--hub-model-id is required when --push-to-hub is enabled."
+        _raise_bad_parameter(msg)  # pyright: ignore[reportGeneralTypeIssues]
+
+    if push_to_hub and output_dir.exists():
+        git_dir = output_dir / ".git"
+        if not git_dir.exists():
+            msg = (
+                f"When --push-to-hub is enabled and --output-dir '{output_dir}' exists, "
+                "it must be a valid git repository clone (containing .git directory)."
+            )
+            _raise_bad_parameter(msg)  # pyright: ignore[reportGeneralTypeIssues]
 
 
 def _load_dataset_from_source(
@@ -227,14 +254,38 @@ def _expand_classification_head(
 
 def _parse_precision(precision: str | None) -> tuple[bool, bool, torch.dtype | None]:
     """Parse precision flag into trainer arguments and dtype."""
+    bf16_supported = torch.cuda.is_bf16_supported()
     if precision is None or precision.lower() == "fp32":
         return False, False, None
     if precision.lower() == "bf16":
+        if not bf16_supported:
+            msg = "bfloat16 is not supported on this device."
+            raise typer.BadParameter(msg)
         return True, False, torch.bfloat16
     if precision.lower() == "fp16":
         return False, True, torch.float16
     msg = "Precision must be one of: fp32, bf16, fp16."
     _raise_bad_parameter(msg)  # pyright: ignore[reportGeneralTypeIssues]
+
+
+def _create_quantization_config(
+    in_4bit: bool,
+    compute_dtype: torch.dtype | None,
+) -> BitsAndBytesConfig:
+    """Construct a BitsAndBytes quantization configuration if requested."""
+    if in_4bit:
+        return BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=compute_dtype,
+        )
+
+    return BitsAndBytesConfig(
+        load_in_8bit=True,
+        llm_int8_skip_modules=["head"],
+        llm_int8_has_fp16_weight=False,
+    )
 
 
 def _create_gradient_mask_hook(num_base_labels: int) -> Callable[[Tensor], Tensor]:
@@ -383,47 +434,70 @@ def main(
     ] = None,
     learning_rate: Annotated[
         float,
-        typer.Option("--learning-rate", min=0.0),
+        typer.Option("--learning-rate", min=0.0, help="Initial learning rate for the optimizer."),
     ] = 5e-5,
     num_train_epochs: Annotated[
         float,
-        typer.Option("--num-epochs", min=0.0),
+        typer.Option(
+            "--num-epochs",
+            min=0.0,
+            help="Total number of training epochs (can be fractional).",
+        ),
     ] = 3.0,
     train_batch_size: Annotated[
         int,
-        typer.Option("--train-batch-size", min=1),
+        typer.Option("--train-batch-size", min=1, help="Per-device training batch size."),
     ] = 8,
     eval_batch_size: Annotated[
         int,
-        typer.Option("--eval-batch-size", min=1),
+        typer.Option("--eval-batch-size", min=1, help="Per-device evaluation batch size."),
     ] = 8,
     gradient_accumulation_steps: Annotated[
         int,
-        typer.Option("--gradient-accumulation-steps", min=1),
+        typer.Option(
+            "--gradient-accumulation-steps",
+            min=1,
+            help="Number of steps to accumulate gradients before updating.",
+        ),
     ] = 1,
     weight_decay: Annotated[
         float,
-        typer.Option("--weight-decay", min=0.0),
+        typer.Option("--weight-decay", min=0.0, help="Weight decay (L2) applied by the optimizer."),
     ] = 0.01,
     warmup_ratio: Annotated[
         float,
-        typer.Option("--warmup-ratio", min=0.0, max=1.0),
+        typer.Option(
+            "--warmup-ratio",
+            min=0.0,
+            max=1.0,
+            help="Fraction of total steps used for linear learning rate warmup.",
+        ),
     ] = 0.05,
     lora_rank: Annotated[
         int,
-        typer.Option("--lora-rank", min=1),
+        typer.Option("--lora-rank", min=1, help="Rank (r) for LoRA adapters."),
     ] = 16,
     lora_alpha: Annotated[
         int,
-        typer.Option("--lora-alpha", min=1),
+        typer.Option("--lora-alpha", min=1, help="LoRA alpha scaling factor."),
     ] = 32,
     lora_dropout: Annotated[
         float,
-        typer.Option("--lora-dropout", min=0.0, max=1.0),
+        typer.Option(
+            "--lora-dropout",
+            min=0.0,
+            max=1.0,
+            help="Dropout probability inside LoRA adapters.",
+        ),
     ] = 0.05,
     mixup_alpha: Annotated[
         float,
-        typer.Option("--mixup-alpha", min=0.0, max=1.0),
+        typer.Option(
+            "--mixup-alpha",
+            min=0.0,
+            max=1.0,
+            help="Alpha parameter for MixUp augmentation (0 to disable).",
+        ),
     ] = 0.0,
     precision: Annotated[
         str | None,
@@ -432,9 +506,19 @@ def main(
             help="Numerical precision: fp32, bf16, or fp16.",
         ),
     ] = "fp32",
+    quantization: Annotated[
+        Literal["none", "8bit", "4bit"],
+        typer.Option(
+            "--quantization",
+            help="Quantization method to use.",
+        ),
+    ] = "none",
     gradient_checkpointing: Annotated[
         bool,
-        typer.Option("--gradient-checkpointing/--no-gradient-checkpointing"),
+        typer.Option(
+            "--gradient-checkpointing/--no-gradient-checkpointing",
+            help="Enable gradient checkpointing to reduce memory usage at the cost of compute.",
+        ),
     ] = True,
     freeze_base_labels: Annotated[
         bool,
@@ -448,11 +532,20 @@ def main(
     ] = False,
     metrics_threshold: Annotated[
         float,
-        typer.Option("--metrics-threshold", min=0.0, max=1.0),
+        typer.Option(
+            "--metrics-threshold",
+            min=0.0,
+            max=1.0,
+            help="Threshold used when computing binary predictions for metrics.",
+        ),
     ] = DEFAULT_THRESHOLD,
     logging_steps: Annotated[
         int,
-        typer.Option("--logging-steps", min=1),
+        typer.Option(
+            "--logging-steps",
+            min=1,
+            help="Number of update steps between two logs when logging_strategy='steps'.",
+        ),
     ] = 50,
     logging_first_step: Annotated[
         bool,
@@ -464,7 +557,7 @@ def main(
     ] = True,
     logging_strategy: Annotated[
         Literal["no", "steps", "epoch"],
-        typer.Option("--logging-strategy"),
+        typer.Option("--logging-strategy", help="Logging strategy: 'no', 'steps', or 'epoch'."),
     ] = "steps",
     save_strategy: Annotated[
         Literal["no", "steps", "epoch"],
@@ -475,7 +568,11 @@ def main(
     ] = "epoch",
     save_total_limit: Annotated[
         int,
-        typer.Option("--save-total-limit", min=1),
+        typer.Option(
+            "--save-total-limit",
+            min=1,
+            help="Maximum number of checkpoints to keep (older ones deleted).",
+        ),
     ] = 2,
     eval_strategy: Annotated[
         Literal["no", "steps", "epoch"],
@@ -486,71 +583,112 @@ def main(
     ] = "epoch",
     eval_accumulation_steps: Annotated[
         int | None,
-        typer.Option("--eval-accumulation-steps", min=1),
+        typer.Option(
+            "--eval-accumulation-steps",
+            min=1,
+            help="Number of prediction steps to accumulate before moving results to CPU.",
+        ),
     ] = None,
     torch_empty_cache_steps: Annotated[
         int | None,
-        typer.Option("--torch-empty-cache-steps", min=1),
+        typer.Option(
+            "--torch-empty-cache-steps",
+            min=1,
+            help="Call torch.empty_cache() every N steps to reduce peak GPU memory.",
+        ),
     ] = None,
     adam_beta1: Annotated[
         float,
-        typer.Option("--adam-beta1", min=0.0, max=1.0),
+        typer.Option("--adam-beta1", min=0.0, max=1.0, help="Beta1 parameter for Adam optimizer."),
     ] = 0.9,
     adam_beta2: Annotated[
         float,
-        typer.Option("--adam-beta2", min=0.0, max=1.0),
+        typer.Option("--adam-beta2", min=0.0, max=1.0, help="Beta2 parameter for Adam optimizer."),
     ] = 0.999,
     adam_epsilon: Annotated[
         float,
-        typer.Option("--adam-epsilon", min=0.0),
+        typer.Option(
+            "--adam-epsilon",
+            min=0.0,
+            help="Epsilon parameter for Adam optimizer numerical stability.",
+        ),
     ] = 1e-8,
     max_grad_norm: Annotated[
         float,
-        typer.Option("--max-grad-norm", min=0.0),
+        typer.Option("--max-grad-norm", min=0.0, help="Max norm for gradient clipping."),
     ] = 1.0,
     max_steps: Annotated[
         int,
-        typer.Option("--max-steps", min=-1),
+        typer.Option(
+            "--max-steps",
+            min=-1,
+            help="If >0, overrides num_epochs and stops after this many optimizer steps.",
+        ),
     ] = -1,
     warmup_steps: Annotated[
         int,
-        typer.Option("--warmup-steps", min=0),
+        typer.Option(
+            "--warmup-steps",
+            min=0,
+            help="Number of warmup steps for the LR scheduler (overrides warmup-ratio if >0).",
+        ),
     ] = 0,
     lr_scheduler_type: Annotated[
         str,
-        typer.Option("--lr-scheduler-type"),
+        typer.Option("--lr-scheduler-type", help="LR scheduler type (e.g. 'linear', 'cosine')."),
     ] = "linear",
     dataloader_drop_last: Annotated[
         bool,
-        typer.Option("--dataloader-drop-last/--no-dataloader-drop-last"),
+        typer.Option(
+            "--dataloader-drop-last/--no-dataloader-drop-last",
+            help="Drop last incomplete batch each epoch when True.",
+        ),
     ] = False,
     dataloader_num_workers: Annotated[
         int,
-        typer.Option("--dataloader-num-workers", min=0),
+        typer.Option(
+            "--dataloader-num-workers",
+            min=0,
+            help="Number of subprocesses for data loading.",
+        ),
     ] = 0,
     dataloader_pin_memory: Annotated[
         bool,
-        typer.Option("--dataloader-pin-memory/--no-dataloader-pin-memory"),
+        typer.Option(
+            "--dataloader-pin-memory/--no-dataloader-pin-memory",
+            help="Pin memory in data loaders for faster host->device transfer.",
+        ),
     ] = True,
     dataloader_persistent_workers: Annotated[
         bool,
-        typer.Option("--dataloader-persistent-workers/--no-dataloader-persistent-workers"),
+        typer.Option(
+            "--dataloader-persistent-workers/--no-dataloader-persistent-workers",
+            help="Keep data loader workers alive between epochs (may speed up training).",
+        ),
     ] = False,
     label_smoothing_factor: Annotated[
         float,
-        typer.Option("--label-smoothing-factor", min=0.0, max=1.0),
+        typer.Option(
+            "--label-smoothing-factor",
+            min=0.0,
+            max=1.0,
+            help="Label smoothing factor applied to targets during loss computation.",
+        ),
     ] = 0.0,
     optim: Annotated[
         OptimizerNames,
-        typer.Option("--optim"),
+        typer.Option("--optim", help="Optimizer to use (see transformers.optimizers)."),
     ] = OptimizerNames.ADAMW_TORCH,
     torch_compile: Annotated[
         bool,
-        typer.Option("--torch-compile/--no-torch-compile"),
+        typer.Option(
+            "--torch-compile/--no-torch-compile",
+            help="Compile model with torch.compile() when available.",
+        ),
     ] = False,
     seed: Annotated[
         int,
-        typer.Option("--seed"),
+        typer.Option("--seed", help="Random seed for reproducibility."),
     ] = 42,
     resume_from_checkpoint: Annotated[
         str | None,
@@ -568,6 +706,13 @@ def main(
         str | None,
         typer.Option("--hub-model-id", help="Hub repo id to push to."),
     ] = None,
+    hub_strategy: Annotated[
+        Literal["end", "every_save", "checkpoint"],
+        typer.Option(
+            "--hub-strategy",
+            help="When to push to the Hub: 'end', 'every_save', or 'checkpoint'.",
+        ),
+    ] = "every_save",
     hub_token: Annotated[
         str | None,
         typer.Option("--hub-token", help="Token for private Hub repos or datasets."),
@@ -579,6 +724,7 @@ def main(
 ) -> None:
     """Run LoRA fine-tuning."""
     _validate_dataset_inputs(dataset_path, dataset_name)
+    _validate_hub_inputs(push_to_hub, hub_model_id, output_dir)
 
     repo_id = MODEL_REPO_MAP.get(model_key.lower())
     if repo_id is None:
@@ -717,16 +863,54 @@ def main(
         )
 
     bf16, fp16, precision_dtype = _parse_precision(precision)
+    quantization_config = None
+    if quantization:
+        quantization_config = _create_quantization_config(
+            in_4bit=(quantization == "4bit"),
+            compute_dtype=precision_dtype,
+        )
+        typer.echo(f"{quantization} quantization enabled.")
 
     typer.echo(f"Loading pretrained model: {repo_id}")
     model = AutoModelForImageClassification.from_pretrained(
         repo_id,
         revision=base_revision,
-        device_map="auto",
         dtype=precision_dtype,
+        quantization_config=quantization_config,
         problem_type="multi_label_classification",
     )
     image_processor = AutoImageProcessor.from_pretrained(repo_id, revision=base_revision)
+
+    if quantization:
+
+        def get_input_embeddings(self) -> nn.Module:
+            base_model = model_key.lower()
+            if base_model in {"eva02-large", "vit-large", "vit", "swinv2"}:
+                return self.timm_model.patch_embed.proj
+            elif base_model == "convnext":
+                return self.timm_model.stem[0]
+
+            msg = f"get_input_embeddings not implemented for model '{base_model}'"
+            raise NotImplementedError(
+                msg,
+            )
+
+        def set_input_embeddings(self, new_module: nn.Module) -> None:
+            base_model = model_key.lower()
+            if base_model in {"eva02-large", "vit-large", "vit", "swinv2"}:
+                self.timm_model.patch_embed.proj = new_module
+            elif base_model == "convnext":
+                self.timm_model.stem[0] = new_module
+            else:
+                msg = f"set_input_embeddings not implemented for model '{base_model}'"
+                raise NotImplementedError(
+                    msg,
+                )
+
+        model.get_input_embeddings = MethodType(get_input_embeddings, model)
+        model.set_input_embeddings = MethodType(set_input_embeddings, model)
+
+        model = prepare_model_for_kbit_training(model)
 
     _expand_classification_head(
         model=model,
@@ -825,12 +1009,14 @@ def main(
         "report_to": report_to,
         "push_to_hub": push_to_hub,
         "hub_model_id": hub_model_id,
+        "hub_strategy": hub_strategy,
         "hub_token": hub_token,
         "hub_private_repo": private,
         "gradient_checkpointing": gradient_checkpointing,
         "load_best_model_at_end": load_best,
         "metric_for_best_model": "auroc",
         "greater_is_better": True,
+        "eval_on_start": True,
     }
     training_args = TrainingArguments(**training_args_kwargs)
 
@@ -852,10 +1038,6 @@ def main(
 
     trainer.save_model()
     image_processor.save_pretrained(output_dir)
-
-    if push_to_hub:
-        typer.echo("Pushing adapters to the Hugging Face Hub...")
-        trainer.push_to_hub()
 
     typer.echo("All done!")
 

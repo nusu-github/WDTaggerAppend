@@ -103,4 +103,4 @@ line-ending = "lf"
 convention = "google"
 
 [tool.pyright]
-include = ["src"]
+include = ["src", "tests"]
