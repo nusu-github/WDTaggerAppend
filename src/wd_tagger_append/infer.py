@@ -223,7 +223,7 @@ class BatchInferenceRunner:
         if not image_paths:
             return []
 
-        inputs = [str(path) for path in image_paths]
+        inputs = [Image.open(path) for path in image_paths]
         model_inputs = self._pipeline.preprocess(inputs)
 
         with torch.inference_mode():
