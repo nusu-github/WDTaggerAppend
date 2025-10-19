@@ -8,13 +8,13 @@ import csv
 import json
 import numbers
 from collections import Counter
-from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import torch
 
-from datasets import ClassLabel, Dataset
+from datasets import ClassLabel, Dataset, Features
 
 VALID_TAG_CATEGORIES: tuple[str, ...] = ("rating", "general", "character")
 
@@ -54,14 +54,19 @@ def _validate_categories(categories: Sequence[str] | None) -> tuple[str, ...]:
     return tuple(normalized)
 
 
-def _iter_metadata(dataset: Dataset | Iterable[Mapping[str, Any]]) -> Iterable[Mapping[str, Any]]:
+def _iter_metadata(dataset: Dataset | Iterable[Mapping[str, Any]]) -> Iterator[Mapping[str, Any]]:
     """Yield metadata dictionaries without materializing large intermediate objects."""
     if isinstance(dataset, Dataset):
         columns_to_drop = [col for col in ("image",) if col in dataset.column_names]
         working_dataset = dataset.remove_columns(columns_to_drop) if columns_to_drop else dataset
-        rating_feature = working_dataset.features.get("rating")
 
-        for example in working_dataset:
+        rating_feature = None
+        features = getattr(working_dataset, "features", None)
+        if isinstance(features, (Features, Mapping)):
+            rating_feature = features.get("rating")
+
+        for record in working_dataset:
+            example = cast("Mapping[str, Any]", record)
             if isinstance(rating_feature, ClassLabel):
                 rating_value = example.get("rating")
                 if isinstance(rating_value, numbers.Integral):
@@ -70,7 +75,8 @@ def _iter_metadata(dataset: Dataset | Iterable[Mapping[str, Any]]) -> Iterable[M
             yield example
         return
 
-    yield from dataset
+    for record in dataset:
+        yield cast("Mapping[str, Any]", record)
 
 
 def _normalize_rating_value(value: Any) -> str | None:

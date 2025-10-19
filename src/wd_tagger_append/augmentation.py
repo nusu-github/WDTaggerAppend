@@ -6,14 +6,15 @@ models. The utilities here are reused by both training and evaluation entrypoint
 """
 
 from collections.abc import Callable, Sequence
-from typing import Any, TypedDict
+from typing import Any, TypedDict, TypeGuard, cast
 
 import torch
 import torch.nn.functional as F
 from torch.utils.data import default_collate
 from torchvision.transforms import InterpolationMode as TorchvisionInterpolationMode, v2
 from torchvision.transforms.v2 import functional as TF
-from transformers import AutoConfig, BaseImageProcessor, BatchFeature
+from transformers import AutoConfig, BaseImageProcessor
+from transformers.image_processing_base import BatchFeature
 from transformers.image_utils import (
     ImageInput,
     make_flat_list_of_images,
@@ -31,6 +32,20 @@ class BatchItem(TypedDict):
 class PadParams(TypedDict):
     padding: list[int]
     needs_padding: bool
+
+
+def _is_str_or_str_lists(value: Any) -> TypeGuard[str | list[str] | list[list[str]]]:
+    if isinstance(value, str):
+        return True
+    if isinstance(value, list):
+        if all(isinstance(item, str) for item in value):
+            return True
+        if all(
+            isinstance(item, list) and all(isinstance(inner, str) for inner in item)
+            for item in value
+        ):
+            return True
+    return False
 
 
 class ToBGR(torch.nn.Module):
@@ -59,7 +74,7 @@ class PadToSquare(v2.Transform):
         super().__init__()
         self.fill = fill
 
-    def make_params(self, flat_inputs: list[Any]) -> PadParams:
+    def make_params(self, flat_inputs: list[Any]) -> dict[str, Any]:
         """Compute symmetric padding required to make the image square.
 
         Args:
@@ -81,7 +96,7 @@ class PadToSquare(v2.Transform):
         needs_padding = any(p > 0 for p in padding)
         return {"padding": padding, "needs_padding": needs_padding}
 
-    def transform(self, inpt: Any, params: PadParams) -> Any:
+    def transform(self, inpt: Any, params: dict[str, Any]) -> Any:
         """Apply the computed padding when the image is not already square.
 
         Args:
@@ -91,10 +106,23 @@ class PadToSquare(v2.Transform):
         Returns:
             Image tensor or PIL image padded to square dimensions.
         """
-        if not params["needs_padding"]:
+        pad_params = cast("PadParams", params)
+        if not pad_params["needs_padding"]:
             return inpt
 
-        return TF.pad(inpt, padding=params["padding"], fill=self.fill, padding_mode="constant")
+        fill_value: float | list[float]
+        fill = self.fill
+        if isinstance(fill, Sequence) and not isinstance(fill, (bytes, str)):
+            fill_value = [float(value) for value in fill]
+        else:
+            fill_value = float(fill)
+
+        return TF.pad(
+            inpt,
+            padding=pad_params["padding"],
+            fill=fill_value,
+            padding_mode="constant",
+        )
 
 
 class RgbaToRgbWithWhiteBackground(torch.nn.Module):
@@ -454,8 +482,13 @@ class WDTaggerImageProcessor(BaseImageProcessor):
 
         transform = self._get_train_transform() if use_train else self._get_eval_transform()
 
-        images = self.fetch_images(images)
-        flat_images = make_flat_list_of_images(images)
+        if _is_str_or_str_lists(images):
+            resolved_images = cast("ImageInput", self.fetch_images(images))
+        else:
+            resolved_images = images
+
+        flat_images = make_flat_list_of_images(resolved_images)
+        flat_images = cast("list[Any]", flat_images)
 
         if not flat_images:
             msg = "No images were provided for preprocessing."

@@ -4,7 +4,7 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import MethodType
-from typing import Annotated, Any, Literal, NoReturn
+from typing import Annotated, Any, Literal, NoReturn, cast
 
 import torch
 import typer
@@ -28,7 +28,15 @@ from transformers import (
 from transformers.training_args import OptimizerNames
 from typer import BadParameter
 
-from datasets import Dataset, DatasetDict, concatenate_datasets, load_dataset, load_from_disk
+from datasets import (
+    Dataset,
+    DatasetDict,
+    IterableDataset,
+    IterableDatasetDict,
+    concatenate_datasets,
+    load_dataset,
+    load_from_disk,
+)
 
 from .augmentation import (
     BatchItem,
@@ -154,7 +162,11 @@ def _load_dataset_from_source(
 
     typer.echo(f"Loading dataset from Hugging Face Hub: {dataset_name}")
     try:
-        return load_dataset(path=dataset_name, name=dataset_config, token=token)
+        loaded = load_dataset(path=dataset_name, name=dataset_config, token=token)
+        if isinstance(loaded, (IterableDataset, IterableDatasetDict)):
+            msg = "Iterable datasets are not supported for training."
+            _raise_bad_parameter(msg)
+        return loaded
     except HfHubHTTPError as exc:
         msg = f"Failed to download dataset {dataset_name} (config={dataset_config})"
         _raise_bad_parameter(msg, cause=exc)
@@ -206,12 +218,13 @@ def _merge_label_lists(
 
 def _resolve_classifier_module(model: TimmWrapperForImageClassification) -> tuple[nn.Linear, str]:
     """Return classifier module and its dotted path."""
-    head = model.timm_model.head
+    head = cast("Any", model.timm_model.head)
     base_path = "timm_model.head"
     if hasattr(head, "fc"):
-        if isinstance(head.fc, nn.Linear):
-            return head.fc, f"{base_path}.fc"
-        msg = f"Classifier head fc is not Linear: {type(head.fc)}"
+        fc_module = head.fc
+        if isinstance(fc_module, nn.Linear):
+            return fc_module, f"{base_path}.fc"
+        msg = f"Classifier head fc is not Linear: {type(fc_module)}"
         raise ValueError(msg)
     if isinstance(head, nn.Linear):
         return head, base_path
@@ -280,7 +293,7 @@ def _expand_classification_head(
                 if use_bias:
                     nn.init.zeros_(new_head.bias[target_idx])
 
-    head = model.timm_model.head
+    head = cast("Any", model.timm_model.head)
     if hasattr(head, "fc"):
         head.fc = new_head
     else:
@@ -936,12 +949,16 @@ def main(
         typer.echo(f"{quantization} quantization enabled.")
 
     typer.echo(f"Loading pretrained model: {repo_id}")
+    pretrained_kwargs: dict[str, Any] = {
+        "dtype": precision_dtype,
+        "quantization_config": quantization_config,
+        "problem_type": "multi_label_classification",
+    }
+    if base_revision is not None:
+        pretrained_kwargs["revision"] = base_revision
     model = TimmWrapperForImageClassification.from_pretrained(
         repo_id,
-        revision=base_revision,
-        dtype=precision_dtype,
-        quantization_config=quantization_config,
-        problem_type="multi_label_classification",
+        **pretrained_kwargs,
     )
 
     _expand_classification_head(
@@ -1002,7 +1019,7 @@ def main(
         modules_to_save=sorted(modules_to_save),
         bias="none",
     )
-    model = get_peft_model(model, lora_config)
+    model = cast("PeftModel", get_peft_model(model, lora_config))
     model.print_trainable_parameters()
 
     # Register gradient masking hooks if base labels should be frozen

@@ -7,25 +7,32 @@ matches training and inference pipelines and reports agreement metrics built on
 torchmetrics.
 """
 
-from __future__ import annotations
-
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import islice
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Literal, cast
+from typing import (
+    Annotated,
+    Any,
+    Literal,
+    cast,
+)
 
 import torch
 import typer
 from PIL import Image
 from torchmetrics import MeanAbsoluteError
 from torchmetrics.classification import MultilabelExactMatch, MultilabelHammingDistance
-from transformers import AutoModelForImageClassification, BitsAndBytesConfig
+from transformers import AutoModelForImageClassification, BitsAndBytesConfig, PreTrainedModel
 
-from datasets import Dataset, IterableDataset, load_dataset
+from datasets import (
+    Dataset,
+    DatasetDict,
+    IterableDataset,
+    IterableDatasetDict,
+    load_dataset,
+)
 from wd_tagger_append.augmentation import WDTaggerImageProcessor
-
-if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator
 
 app = typer.Typer(add_completion=False)
 
@@ -35,8 +42,8 @@ IMAGE_EXTENSIONS = {ext.lower() for ext in Image.registered_extensions()}
 @dataclass
 class BenchmarkInputs:
     processor: WDTaggerImageProcessor
-    model_fp32: AutoModelForImageClassification
-    model_quantized: AutoModelForImageClassification
+    model_fp32: PreTrainedModel
+    model_quantized: PreTrainedModel
     threshold: float
     topk_ratio: float
     batch_size: int
@@ -123,7 +130,8 @@ def _iter_hf_dataset(
     dataset: Dataset | IterableDataset,
     image_column: str,
 ) -> Iterator[Image.Image]:
-    for record in dataset:
+    records = cast("Iterable[Mapping[str, Any]]", dataset)
+    for record in records:
         image_data = record[image_column]
         if isinstance(image_data, Image.Image):
             yield image_data.convert("RGB")
@@ -142,12 +150,13 @@ def _collect_image_iterator(
     if dataset_path is not None and dataset_name is not None:
         msg = "Use either --dataset-path or --dataset-name, not both."
         raise typer.BadParameter(msg)
-    if dataset_path is None and dataset_name is None:
-        msg = "Provide --dataset-path for local files or --dataset-name for Hugging Face datasets."
-        raise typer.BadParameter(msg)
 
     if dataset_path is not None:
         return _iter_local_images(dataset_path)
+
+    if dataset_name is None:
+        msg = "Provide --dataset-path for local files or --dataset-name for Hugging Face datasets."
+        raise typer.BadParameter(msg)
 
     dataset = load_dataset(
         path=dataset_name,
@@ -155,9 +164,22 @@ def _collect_image_iterator(
         split=dataset_split,
         streaming=streaming,
     )
-    if image_column not in dataset.column_names:
+
+    if isinstance(dataset, (DatasetDict, IterableDatasetDict)):
+        msg = "Loading with --dataset-split should return a single dataset split."
+        raise typer.BadParameter(msg)
+
+    column_names_raw = getattr(dataset, "column_names", None)
+    columns: Sequence[str] | None
+    if isinstance(column_names_raw, dict):
+        columns = column_names_raw.get(dataset_split)
+    else:
+        columns = column_names_raw
+
+    if columns is None or image_column not in columns:
         msg = f"Column '{image_column}' not present in dataset."
         raise typer.BadParameter(msg)
+
     return _iter_hf_dataset(dataset, image_column=image_column)
 
 
@@ -166,10 +188,13 @@ def _run_benchmark(
     inputs: BenchmarkInputs,
     device: torch.device,
 ) -> BenchmarkResult:
-    model_fp32 = inputs.model_fp32.to(device)
-    model_fp32.eval()
+    model_fp32 = inputs.model_fp32
+    module_fp32 = cast("torch.nn.Module", model_fp32)
+    module_fp32.to(device)
+    module_fp32.eval()
     model_quantized = inputs.model_quantized
-    model_quantized.eval()
+    module_quantized = cast("torch.nn.Module", model_quantized)
+    module_quantized.eval()
 
     mae_metric = MeanAbsoluteError()
     hamming_metric: MultilabelHammingDistance | None = None
@@ -222,6 +247,9 @@ def _run_benchmark(
                 num_labels=num_labels,
                 threshold=inputs.threshold,
             )
+
+        assert hamming_metric is not None
+        assert exact_metric is not None
 
         mae_metric.update(probs_quantized, probs_fp32)
         hamming_metric.update(probs_quantized, probs_fp32)
@@ -294,7 +322,6 @@ def main(
         Path | None,
         typer.Option(
             "--dataset-path",
-            path_type=Path,
             help="Directory of images to evaluate.",
         ),
     ] = None,
