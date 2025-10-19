@@ -1,245 +1,335 @@
 from __future__ import annotations
 
+import os
+import re
+import shutil
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Annotated, Any, cast
+from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
 
-import numpy as np
-import pandas as pd
 import torch
 import typer
-from huggingface_hub import hf_hub_download
-from huggingface_hub.errors import HfHubHTTPError
 from peft import PeftConfig, PeftModel
 from PIL import Image
-from torch import Tensor
 from torch.nn import functional as F
 from transformers import (
     AutoModelForImageClassification,
-    BitsAndBytesConfig,
 )
 
-from wd_tagger_append.augmentation import create_eval_transform
+from wd_tagger_append.augmentation import WDTaggerImageProcessor
+from wd_tagger_append.inference_utils import (
+    MODEL_REPO_MAP,
+    LabelData,
+    _create_quantization_config,
+    _is_local_path,
+    _load_label_data,
+    _parse_precision,
+    _resolve_base_model_identifier,
+    get_tags,
+)
 
-app = typer.Typer(help="WD Tagger v3 inference with timm")
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+    from pathlib import Path
 
-MODEL_REPO_MAP = {
-    "swinv2": "SmilingWolf/wd-swinv2-tagger-v3",
-    "convnext": "SmilingWolf/wd-convnext-tagger-v3",
-    "vit": "SmilingWolf/wd-vit-tagger-v3",
-    "vit-large": "SmilingWolf/wd-vit-large-tagger-v3",
-    "eva02-large": "SmilingWolf/wd-eva02-large-tagger-v3",
+IMAGE_EXTENSIONS = {
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".webp",
+    ".bmp",
+    ".gif",
+    ".tif",
+    ".tiff",
 }
 
 
 @dataclass
-class LabelData:
-    names: list[str]
-    rating: list[np.int64]
-    general: list[np.int64]
-    character: list[np.int64]
+class InferenceResult:
+    image_path: Path
+    caption: str
+    tag_string: str
+    ratings: dict[str, float]
+    character: dict[str, float]
+    general: dict[str, float]
 
 
-def _load_labels_from_csv(csv_path: Path) -> LabelData:
-    """Load label metadata from a selected_tags.csv file."""
-    df: pd.DataFrame = pd.read_csv(csv_path)
-    return LabelData(
-        names=df["name"].tolist(),
-        rating=list(np.where(df["category"] == 9)[0]),
-        general=list(np.where(df["category"] == 0)[0]),
-        character=list(np.where(df["category"] == 4)[0]),
-    )
+_SANITIZE_PATTERN = re.compile(r"[<>:\"/\\|?*\n\r]+")
 
 
-def _resolve_base_model_identifier(model: str, repo_override: str | None) -> str:
-    """Resolve the base model repo or path from CLI inputs."""
-    if repo_override:
-        return repo_override
-    if model in MODEL_REPO_MAP:
-        return MODEL_REPO_MAP[model]
-    return model
-
-
-def _is_local_path(source: str) -> bool:
-    """Return True if the given source refers to an existing local path."""
+def _move_inputs_to_model_device(model: torch.nn.Module, inputs: torch.Tensor) -> torch.Tensor:
+    device_attr = getattr(model, "device", None)
+    if isinstance(device_attr, torch.device):
+        return inputs.to(device=device_attr)
     try:
-        return Path(source).expanduser().exists()
-    except OSError:
-        return False
+        first_param = next(model.parameters())
+        return inputs.to(device=first_param.device)
+    except StopIteration:
+        return inputs.to(device="cpu")
 
 
-def _create_quantization_config() -> BitsAndBytesConfig | None:
-    """Construct a BitsAndBytes quantization configuration if requested."""
-    return BitsAndBytesConfig(
-        load_in_8bit=True,
-        llm_int8_skip_modules=["head"],
-    )
-
-
-def _parse_precision(precision: str | None) -> torch.dtype | None:
-    """Parse precision flag into torch dtype."""
-    bf16_supported = torch.cuda.is_bf16_supported()
-    if precision is None or precision.lower() == "fp32":
-        return None
-    normalized = precision.lower()
-    if normalized == "bf16":
-        if not bf16_supported:
-            msg = "bfloat16 is not supported on this device."
-            raise typer.BadParameter(msg)
-        return torch.bfloat16
-    if normalized == "fp16":
-        return torch.float16
-    msg = "Precision must be one of: fp32, bf16, fp16."
-    raise typer.BadParameter(msg)
-
-
-def _load_csv_from_source(
-    source: str | None,
-    adapter: str | None,
-    adapter_revision: str | None,
-    adapter_token: str | None,
-) -> Path | None:
-    """Locate a selected_tags.csv file from CLI options or adapter repo."""
-    if source is not None:
-        path = Path(source).expanduser()
-        if not path.exists():
-            msg = f"Label file not found: {source}"
-            raise typer.BadParameter(msg)
-        return path
-
-    if adapter is None:
-        return None
-
-    # Try to resolve local adapter first.
-    if _is_local_path(adapter):
-        candidate = Path(adapter) / "selected_tags.csv"
-        if candidate.exists():
-            return candidate
-        return None
-
-    try:
-        downloaded = hf_hub_download(
-            repo_id=adapter,
-            filename="selected_tags.csv",
-            revision=adapter_revision,
-            token=adapter_token,
-        )
-        return Path(downloaded)
-    except HfHubHTTPError:
-        return None
-
-
-def _load_label_data(
-    base_repo: str,
-    revision: str | None,
-    token: str | None,
-    labels_path: Path | None,
-    adapter: str | None,
-    adapter_revision: str | None,
-    adapter_token: str | None,
-    fallback_repo: str | None = None,
-) -> LabelData:
-    """Load label metadata, falling back to the base model's selected_tags.csv."""
-    base_labels: LabelData
-    if _is_local_path(base_repo):
-        local_csv = Path(base_repo).expanduser() / "selected_tags.csv"
-        if local_csv.exists():
-            base_labels = _load_labels_from_csv(local_csv)
-        elif fallback_repo is not None and not _is_local_path(fallback_repo):
-            typer.echo(
-                f"selected_tags.csv not found locally; downloading labels from '{fallback_repo}'.",
-            )
-            base_labels = load_labels_hf(
-                repo_id=fallback_repo,
-                revision=revision,
-                token=token,
-            )
-        else:
-            typer.echo(
-                "Warning: selected_tags.csv not found in local base model directory; "
-                "category data for new labels will default to 'general'.",
-                err=True,
-            )
-            base_labels = LabelData(names=[], rating=[], general=[], character=[])
-    else:
-        base_labels = load_labels_hf(repo_id=base_repo, revision=revision, token=token)
-
-    csv_path = _load_csv_from_source(
-        str(labels_path) if labels_path is not None else None,
-        adapter=adapter,
-        adapter_revision=adapter_revision,
-        adapter_token=adapter_token,
-    )
-    if csv_path is None:
-        return base_labels
-
-    typer.echo(f"Loading labels from {csv_path}...")
-    return _load_labels_from_csv(csv_path)
-
-
-def load_labels_hf(
-    repo_id: str,
-    revision: str | None = None,
-    token: str | None = None,
-) -> LabelData:
-    try:
-        csv_path = hf_hub_download(
-            repo_id=repo_id,
-            filename="selected_tags.csv",
-            revision=revision,
-            token=token,
-        )
-        csv_path = Path(csv_path).resolve()
-    except HfHubHTTPError as e:
-        msg = f"selected_tags.csv failed to download from {repo_id}"
-        raise FileNotFoundError(msg) from e
-
-    return _load_labels_from_csv(csv_path)
-
-
-def get_tags(
-    probs: Tensor,
+def _infer_single_image(
+    image_path: Path,
+    model: torch.nn.Module,
+    image_processor: WDTaggerImageProcessor,
     labels: LabelData,
     gen_threshold: float,
     char_threshold: float,
-) -> tuple[str, str, dict[str, float], dict[str, float], dict[str, float]]:
-    # Convert model probabilities into python floats to keep typing simple
-    prob_values = probs.detach().cpu().numpy().tolist()
+) -> InferenceResult:
+    with Image.open(image_path) as img_input:
+        batch = image_processor(images=img_input, return_tensors="pt")
 
-    rating_labels: dict[str, float] = {
-        labels.names[i]: float(prob_values[i]) for i in labels.rating
-    }
+    inputs = batch["pixel_values"]
+    inputs = _move_inputs_to_model_device(model, inputs)
 
-    general_candidates = [
-        (labels.names[i], float(prob_values[i]))
-        for i in labels.general
-        if prob_values[i] > gen_threshold
-    ]
-    gen_labels: dict[str, float] = dict(
-        sorted(general_candidates, key=lambda item: item[1], reverse=True),
+    with torch.inference_mode():
+        logits = model(inputs).logits
+        probs = F.sigmoid(logits)
+
+    caption, taglist, ratings, character, general = get_tags(
+        probs=probs.to("cpu").squeeze(0),
+        labels=labels,
+        gen_threshold=gen_threshold,
+        char_threshold=char_threshold,
     )
 
-    character_candidates = [
-        (labels.names[i], float(prob_values[i]))
-        for i in labels.character
-        if prob_values[i] > char_threshold
-    ]
-    char_labels: dict[str, float] = dict(
-        sorted(character_candidates, key=lambda item: item[1], reverse=True),
+    return InferenceResult(
+        image_path=image_path,
+        caption=caption,
+        tag_string=taglist,
+        ratings=ratings,
+        character=character,
+        general=general,
     )
 
-    combined_names = [name for name, _ in general_candidates]
-    combined_names.extend(name for name, _ in character_candidates)
 
-    caption = ", ".join(combined_names)
-    taglist = caption.replace("_", " ").replace("(", r"\(").replace(")", r"\)")
+def _gather_image_paths(image_dir: Path) -> list[Path]:
+    return sorted(
+        path
+        for path in image_dir.rglob("*")
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+    )
 
-    return caption, taglist, rating_labels, char_labels, gen_labels
+
+def _extract_tag_names(
+    result: InferenceResult,
+    category: Literal["rating", "character", "general"],
+    rating_threshold: float,
+) -> list[str]:
+    if category == "rating":
+        return [
+            name
+            for name, score in sorted(
+                result.ratings.items(),
+                key=lambda item: item[1],
+                reverse=True,
+            )
+            if score >= rating_threshold
+        ]
+    if category == "character":
+        return list(result.character.keys())
+    if category == "general":
+        return list(result.general.keys())
+    return []
+
+
+def _format_tag_list(names: Iterable[str]) -> str:
+    names_list = list(names)
+    return ", ".join(names_list) if names_list else "none"
+
+
+def _sanitize_folder_name(name: str) -> str:
+    sanitized = name.replace(os.sep, "_")
+    if os.altsep:
+        sanitized = sanitized.replace(os.altsep, "_")
+    sanitized = _SANITIZE_PATTERN.sub("_", sanitized)
+    sanitized = sanitized.strip().strip(".")
+    return sanitized or "no_tag"
+
+
+def _write_text_results(
+    results: list[InferenceResult],
+    output_path: Path,
+    base_dir: Path,
+    rating_threshold: float,
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as handle:
+        for result in results:
+            try:
+                relative_path = result.image_path.relative_to(base_dir)
+            except ValueError:
+                relative_path = result.image_path
+
+            rating_names = _format_tag_list(
+                _extract_tag_names(result, "rating", rating_threshold),
+            )
+            character_names = _format_tag_list(
+                _extract_tag_names(result, "character", rating_threshold),
+            )
+            general_names = _format_tag_list(
+                _extract_tag_names(result, "general", rating_threshold),
+            )
+
+            line = (
+                f"{relative_path}, Ratings: {rating_names}, "
+                f"Character: {character_names}, General: {general_names}\n"
+            )
+            handle.write(line)
+
+
+def _organize_files(
+    results: Iterable[InferenceResult],
+    dest_root: Path,
+    category: Literal["rating", "character", "general"],
+    mode: Literal["copy", "move"],
+    rating_threshold: float,
+    overwrite: bool,
+) -> tuple[int, int]:
+    dest_root.mkdir(parents=True, exist_ok=True)
+    processed = 0
+    skipped = 0
+
+    for result in results:
+        tag_names = _extract_tag_names(result, category, rating_threshold)
+        folder_name = ", ".join(tag_names) if tag_names else "no_tag"
+        safe_folder_name = _sanitize_folder_name(folder_name)
+        target_dir = dest_root / safe_folder_name
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        destination = target_dir / result.image_path.name
+        try:
+            if result.image_path.resolve() == destination.resolve():
+                skipped += 1
+                typer.echo(
+                    f"Skipping '{result.image_path}' because destination is identical.",
+                    err=True,
+                )
+                continue
+        except FileNotFoundError:
+            # One of the paths may not exist yet (e.g., destination). Ignore.
+            pass
+
+        if destination.exists():
+            if not overwrite:
+                skipped += 1
+                typer.echo(
+                    f"Skipping '{result.image_path}' -> '{destination}' (exists). "
+                    "Use --dir-overwrite to replace.",
+                    err=True,
+                )
+                continue
+            if destination.is_file():
+                destination.unlink()
+
+        if mode == "copy":
+            shutil.copy2(result.image_path, destination)
+        else:
+            shutil.move(result.image_path, destination)
+        processed += 1
+
+    return processed, skipped
+
+
+def _print_single_result(
+    result: InferenceResult,
+    gen_threshold: float,
+    char_threshold: float,
+) -> None:
+    typer.echo("--------")
+    typer.echo(f"Caption: {result.caption}")
+    typer.echo("--------")
+    typer.echo(f"Tags: {result.tag_string}")
+
+    typer.echo("--------")
+    typer.echo("Ratings:")
+    for name, score in result.ratings.items():
+        typer.echo(f"  {name}: {score:.3f}")
+
+    typer.echo("--------")
+    typer.echo(f"Character tags (threshold={char_threshold}):")
+    for name, score in result.character.items():
+        typer.echo(f"  {name}: {score:.3f}")
+
+    typer.echo("--------")
+    typer.echo(f"General tags (threshold={gen_threshold}):")
+    for name, score in result.general.items():
+        typer.echo(f"  {name}: {score:.3f}")
+
+
+def _process_directory(
+    image_dir: Path,
+    model: torch.nn.Module,
+    image_processor: WDTaggerImageProcessor,
+    labels: LabelData,
+    gen_threshold: float,
+    char_threshold: float,
+    dir_output: Literal["text", "copy", "move", "none"],
+    dir_text_file: Path | None,
+    dir_category: Literal["rating", "character", "general"],
+    dir_destination: Path | None,
+    dir_overwrite: bool,
+    rating_threshold: float,
+) -> None:
+    image_paths = _gather_image_paths(image_dir)
+    if not image_paths:
+        typer.echo(f"No images found in {image_dir}", err=True)
+        return
+
+    typer.echo(f"Found {len(image_paths)} image(s) under {image_dir}")
+    results: list[InferenceResult] = []
+    for idx, path in enumerate(image_paths, start=1):
+        typer.echo(f"[{idx}/{len(image_paths)}] Processing {path}")
+        try:
+            result = _infer_single_image(
+                image_path=path,
+                model=model,
+                image_processor=image_processor,
+                labels=labels,
+                gen_threshold=gen_threshold,
+                char_threshold=char_threshold,
+            )
+        except Exception as exc:  # noqa: BLE001
+            typer.echo(f"Failed to process '{path}': {exc}", err=True)
+            continue
+        results.append(result)
+
+    if not results:
+        typer.echo("No images were processed successfully.", err=True)
+        return
+
+    if dir_output == "text":
+        output_path = dir_text_file or (image_dir / "wd_tagger_results.txt")
+        _write_text_results(
+            results,
+            output_path=output_path,
+            base_dir=image_dir,
+            rating_threshold=rating_threshold,
+        )
+        typer.echo(f"Wrote directory results to {output_path}")
+    elif dir_output in {"copy", "move"}:
+        dest_root = dir_destination or (image_dir / f"sorted_by_{dir_category}")
+        mode = cast("Literal['copy', 'move']", dir_output)
+        processed, skipped = _organize_files(
+            results,
+            dest_root=dest_root,
+            category=dir_category,
+            mode=mode,
+            rating_threshold=rating_threshold,
+            overwrite=dir_overwrite,
+        )
+        typer.echo(f"{mode.capitalize()}d {processed} file(s) to {dest_root}")
+        if skipped:
+            typer.echo(f"Skipped {skipped} file(s).", err=True)
+    else:
+        typer.echo(f"Processed {len(results)} image(s); no directory output requested.")
+
+
+app = typer.Typer(help="WD Tagger v3 inference with timm")
 
 
 @app.command()
 def main(
-    image_file: Annotated[Path, typer.Argument(help="Path to the image file")],
+    image_file: Annotated[Path, typer.Argument(help="Path to an image file or directory")],
     model: Annotated[
         str,
         typer.Option("--model", "-m", help="Model key, repo ID, or local path for the base model."),
@@ -316,11 +406,79 @@ def main(
         str | None,
         typer.Option("--device-map", help="Device map for model loading (default: auto)."),
     ] = "auto",
+    rating_threshold: Annotated[
+        float,
+        typer.Option(
+            "--rating-threshold",
+            min=0.0,
+            max=1.0,
+            help=(
+                "Minimum probability used to mark rating tags as detected when processing directories."
+            ),
+        ),
+    ] = 0.5,
+    dir_output: Annotated[
+        Literal["text", "copy", "move", "none"],
+        typer.Option(
+            "--dir-output",
+            help=(
+                "Output mode when the input path is a directory. "
+                "Choose from 'text', 'copy', 'move', or 'none'."
+            ),
+            case_sensitive=False,
+        ),
+    ] = "text",
+    dir_text_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--dir-text-file",
+            help="Destination file for directory summaries when --dir-output=text.",
+            file_okay=True,
+            dir_okay=False,
+            resolve_path=True,
+        ),
+    ] = None,
+    dir_category: Annotated[
+        Literal["rating", "character", "general"],
+        typer.Option(
+            "--dir-category",
+            help=(
+                "Tag category used when organizing directories with copy/move output. "
+                "Ignored for text or none."
+            ),
+            case_sensitive=False,
+        ),
+    ] = "general",
+    dir_destination: Annotated[
+        Path | None,
+        typer.Option(
+            "--dir-destination",
+            help=(
+                "Root directory to create tag folders in when --dir-output is copy or move. "
+                "Defaults to '<input>/sorted_by_<category>'."
+            ),
+            file_okay=False,
+            resolve_path=True,
+        ),
+    ] = None,
+    dir_overwrite: Annotated[
+        bool,
+        typer.Option(
+            "--dir-overwrite/--no-dir-overwrite",
+            help="Overwrite files that already exist in the destination when copying or moving.",
+        ),
+    ] = False,
 ) -> None:
     image_path = image_file.resolve()
-    if not image_path.is_file():
-        typer.echo(f"Error: Image file not found: {image_path}", err=True)
+    if not image_path.exists():
+        typer.echo(f"Error: Path not found: {image_path}", err=True)
         raise typer.Exit(code=1)
+    if not (image_path.is_file() or image_path.is_dir()):
+        typer.echo(f"Error: Path must be a file or directory: {image_path}", err=True)
+        raise typer.Exit(code=1)
+
+    dir_output = cast("Literal['text', 'copy', 'move', 'none']", dir_output.lower())
+    dir_category = cast("Literal['rating', 'character', 'general']", dir_category.lower())
 
     adapter_token_final = adapter_token or token
     base_identifier = _resolve_base_model_identifier(model, repo_id)
@@ -343,6 +501,10 @@ def main(
 
     # Load label metadata first to determine num_labels for model initialization
     typer.echo("Loading label metadata...")
+
+    def _emit_label_message(message: str) -> None:
+        typer.echo(message, err=message.startswith("Warning:"))
+
     labels: LabelData = _load_label_data(
         base_repo=base_identifier,
         revision=revision,
@@ -352,10 +514,14 @@ def main(
         adapter_revision=adapter_revision,
         adapter_token=adapter_token_final,
         fallback_repo=(peft_config.base_model_name_or_path if peft_config is not None else None),
+        warning_callback=_emit_label_message,
     )
 
-    precision_dtype = _parse_precision(precision)
-    quantization_config = _create_quantization_config()
+    try:
+        precision_dtype = _parse_precision(precision)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    quantization_config = _create_quantization_config() if quantization else None
 
     base_kwargs: dict[str, Any] = {}
     if quantization_config is not None:
@@ -392,56 +558,43 @@ def main(
     hf_model = hf_model.eval()
 
     typer.echo("Creating data transform...")
-    transforms = create_eval_transform(base_identifier)
+    image_processor = WDTaggerImageProcessor(base_identifier)
+
+    if image_path.is_dir():
+        _process_directory(
+            image_dir=image_path,
+            model=hf_model,
+            image_processor=image_processor,
+            labels=labels,
+            gen_threshold=gen_threshold,
+            char_threshold=char_threshold,
+            dir_output=dir_output,
+            dir_text_file=dir_text_file,
+            dir_category=dir_category,
+            dir_destination=dir_destination,
+            dir_overwrite=dir_overwrite,
+            rating_threshold=rating_threshold,
+        )
+        typer.echo("Done!")
+        return
 
     typer.echo("Loading image and preprocessing...")
-    img_input: Image.Image = Image.open(image_path)
-    inputs = transforms(img_input).unsqueeze(0)  # Add batch dimension
-
-    # Move inputs to the primary device if necessary.
-    if hasattr(hf_model, "device"):
-        inputs = inputs.to(hf_model.device)
-    else:
-        try:
-            first_param = next(hf_model.parameters())
-            inputs = inputs.to(first_param.device)
-        except StopIteration:
-            inputs = inputs.to("cpu")
-
-    typer.echo("Running inference...")
-    with torch.inference_mode():
-        # run the model
-        outputs = hf_model(inputs).logits
-        # apply the final activation function (timm doesn't support doing this internally)
-        outputs = F.sigmoid(outputs)
-
-    typer.echo("Processing results...")
-    caption, taglist, ratings, character, general = get_tags(
-        probs=outputs.to("cpu").squeeze(0),
+    result = _infer_single_image(
+        image_path=image_path,
+        model=hf_model,
+        image_processor=image_processor,
         labels=labels,
         gen_threshold=gen_threshold,
         char_threshold=char_threshold,
     )
 
-    typer.echo("--------")
-    typer.echo(f"Caption: {caption}")
-    typer.echo("--------")
-    typer.echo(f"Tags: {taglist}")
-
-    typer.echo("--------")
-    typer.echo("Ratings:")
-    for k, v in ratings.items():
-        typer.echo(f"  {k}: {v:.3f}")
-
-    typer.echo("--------")
-    typer.echo(f"Character tags (threshold={char_threshold}):")
-    for k, v in character.items():
-        typer.echo(f"  {k}: {v:.3f}")
-
-    typer.echo("--------")
-    typer.echo(f"General tags (threshold={gen_threshold}):")
-    for k, v in general.items():
-        typer.echo(f"  {k}: {v:.3f}")
+    typer.echo("Running inference...")
+    typer.echo("Processing results...")
+    _print_single_result(
+        result,
+        gen_threshold=gen_threshold,
+        char_threshold=char_threshold,
+    )
 
     typer.echo("Done!")
 

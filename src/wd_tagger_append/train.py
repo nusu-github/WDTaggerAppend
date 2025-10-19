@@ -20,7 +20,6 @@ from peft import (
 from peft.utils import ModulesToSaveWrapper
 from torch import Tensor, nn
 from transformers import (
-    AutoImageProcessor,
     AutoModelForImageClassification,
     BitsAndBytesConfig,
     DefaultDataCollator,
@@ -33,9 +32,8 @@ from typer import BadParameter
 from datasets import Dataset, DatasetDict, concatenate_datasets, load_dataset, load_from_disk
 from wd_tagger_append.augmentation import (
     BatchItem,
-    create_eval_transform,
+    WDTaggerImageProcessor,
     create_mixup_collate_fn,
-    create_train_transform,
 )
 from wd_tagger_append.dataset_utils import (
     categorize_label_list,
@@ -46,7 +44,7 @@ from wd_tagger_append.dataset_utils import (
     load_allowed_tags,
     save_labels_as_csv,
 )
-from wd_tagger_append.infer import MODEL_REPO_MAP, load_labels_hf
+from wd_tagger_append.inference_utils import MODEL_REPO_MAP, load_labels_hf
 from wd_tagger_append.loss import AsymmetricLossMultiLabel
 from wd_tagger_append.metrics import DEFAULT_THRESHOLD, create_compute_metrics_fn
 
@@ -864,17 +862,31 @@ def main(
     save_labels_as_csv(label_list, tag_categories, csv_path)
     typer.echo(f"Saved labels as CSV to {csv_path}")
 
-    train_transform = create_train_transform(
-        pretrained_model_name_or_path=repo_id,
-    )
+    typer.echo("Initializing image processor pipelines...")
+    image_processor = WDTaggerImageProcessor(pretrained_model_name_or_path=repo_id)
+
+    def _processor_transform(image: Any, train: bool) -> torch.Tensor:
+        features = image_processor(
+            images=image,
+            return_tensors="pt",
+            do_train_augmentations=train,
+        )
+        pixel_values: torch.Tensor = features["pixel_values"]
+        return pixel_values.squeeze(0) if pixel_values.ndim == 4 else pixel_values
+
+    def _train_image_transform(image: Any) -> torch.Tensor:
+        return _processor_transform(image, train=True)
+
+    def _eval_image_transform(image: Any) -> torch.Tensor:
+        return _processor_transform(image, train=False)
+
     train_dataset = splits.train.with_transform(
-        create_transform_function(train_transform, label2id, all_categories),
+        create_transform_function(_train_image_transform, label2id, all_categories),
     )
     eval_dataset = None
     if splits.eval is not None:
-        eval_transform = create_eval_transform(pretrained_model_name_or_path=repo_id)
         eval_dataset = splits.eval.with_transform(
-            create_transform_function(eval_transform, label2id, all_categories),
+            create_transform_function(_eval_image_transform, label2id, all_categories),
         )
 
     bf16, fp16, precision_dtype = _parse_precision(precision)
@@ -894,7 +906,6 @@ def main(
         quantization_config=quantization_config,
         problem_type="multi_label_classification",
     )
-    image_processor = AutoImageProcessor.from_pretrained(repo_id, revision=base_revision)
 
     _expand_classification_head(
         model=model,

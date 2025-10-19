@@ -14,10 +14,21 @@ import torch.nn.functional as F
 from torch.utils.data import default_collate
 from torchvision.transforms import InterpolationMode as TorchvisionInterpolationMode, v2
 from torchvision.transforms.v2 import functional as TF
-from transformers import AutoConfig
+from transformers import AutoConfig, BaseImageProcessor, BatchFeature
+from transformers.image_utils import (
+    ImageInput,
+    make_flat_list_of_images,
+    valid_images,
+    validate_kwargs,
+)
+from transformers.utils import logging
+
+logger = logging.get_logger(__name__)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
+
+    from transformers.utils.generic import TensorType
 
 
 class BatchItem(TypedDict):
@@ -388,6 +399,114 @@ def create_eval_transform(
             ToBGR(),  # Convert RGB to BGR
         ],
     )
+
+
+class WDTaggerImageProcessor(BaseImageProcessor):
+    """Image processor that mirrors WD Tagger preprocessing pipelines.
+
+    The processor reuses the torchvision v2 augmentation helpers defined in this
+    module to provide train-time and eval-time transform stacks that match the
+    original TensorFlow implementation used to train WD Tagger models.
+    """
+
+    model_input_names = ["pixel_values"]
+
+    def __init__(
+        self,
+        pretrained_model_name_or_path: str,
+        do_train_augmentations: bool = False,
+        random_crop_scale: tuple[float, float] = (0.87, 0.998),
+        rotation_degrees: float = 0.0,
+        cutout_scale: tuple[float, float] = (0.02, 0.1),
+        cutout_ratio: tuple[float, float] = (0.3, 3.3),
+        random_resize_method: bool = True,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.pretrained_model_name_or_path = pretrained_model_name_or_path
+        self.random_crop_scale = random_crop_scale
+        self.rotation_degrees = rotation_degrees
+        self.cutout_scale = cutout_scale
+        self.cutout_ratio = cutout_ratio
+        self.random_resize_method = random_resize_method
+        self.do_train_augmentations = do_train_augmentations
+
+        image_size, mean, std = _load_image_processor_stats(pretrained_model_name_or_path)
+        self.image_size = image_size
+        self.image_mean = tuple(mean)
+        self.image_std = tuple(std)
+        self.size = {"height": image_size, "width": image_size}
+
+        self._train_transform: v2.Compose | None = None
+        self._eval_transform: v2.Compose | None = None
+
+        self._valid_processor_keys = [
+            "images",
+            "do_train_augmentations",
+            "return_tensors",
+        ]
+
+    def _get_train_transform(self) -> v2.Compose:
+        if self._train_transform is None:
+            self._train_transform = create_train_transform(
+                pretrained_model_name_or_path=self.pretrained_model_name_or_path,
+                random_crop_scale=self.random_crop_scale,
+                rotation_degrees=self.rotation_degrees,
+                cutout_scale=self.cutout_scale,
+                cutout_ratio=self.cutout_ratio,
+                random_resize_method=self.random_resize_method,
+            )
+        return self._train_transform
+
+    def _get_eval_transform(self) -> v2.Compose:
+        if self._eval_transform is None:
+            self._eval_transform = create_eval_transform(
+                pretrained_model_name_or_path=self.pretrained_model_name_or_path,
+            )
+        return self._eval_transform
+
+    def preprocess(  # pyright: ignore[reportIncompatibleMethodOverride]
+        self,
+        images: ImageInput,
+        do_train_augmentations: bool | None = None,
+        return_tensors: str | TensorType | None = None,
+        **kwargs,
+    ) -> BatchFeature:
+        validate_kwargs(
+            captured_kwargs=list(kwargs.keys()),
+            valid_processor_keys=self._valid_processor_keys,
+        )
+
+        use_train = (
+            self.do_train_augmentations
+            if do_train_augmentations is None
+            else do_train_augmentations
+        )
+
+        transform = self._get_train_transform() if use_train else self._get_eval_transform()
+
+        images = self.fetch_images(images)  # type: ignore
+        flat_images = make_flat_list_of_images(images)
+
+        if not flat_images:
+            msg = "No images were provided for preprocessing."
+            raise ValueError(msg)
+
+        if not valid_images(flat_images):
+            msg = "Invalid image type. Expected PIL, numpy array, or torch tensor inputs."
+            raise ValueError(msg)
+
+        processed = [transform(image) for image in flat_images]  # type: ignore
+
+        if use_train:
+            logger.debug("Applied training augmentations in WDTaggerImageProcessor.")
+
+        tensor_type_name = getattr(return_tensors, "value", return_tensors)
+        if tensor_type_name == "pt":
+            data = {"pixel_values": torch.stack(processed)}
+        else:
+            data = {"pixel_values": processed}
+        return BatchFeature(data=data, tensor_type=return_tensors)
 
 
 def create_mixup_collate_fn(
