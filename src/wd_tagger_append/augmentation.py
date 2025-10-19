@@ -30,6 +30,27 @@ class PadParams(TypedDict):
     needs_padding: bool
 
 
+class ToColorWithCheckIncluded(torch.nn.Module):
+    def forward(self, image: torch.Tensor) -> torch.Tensor:
+        """Convert grayscale image to RGB format if needed.
+
+        Args:
+            image: Input image tensor.
+
+        Returns:
+            Image in RGB format as Tensor.
+        """
+        if image.shape[0] == 1:
+            # Convert grayscale to RGB by repeating channels
+            image = image.repeat(3, 1, 1)
+        elif image.shape[0] == 2:
+            # Convert grayscale + alpha to RGBA by repeating channels
+            rgb = image[0:1, :, :].repeat(3, 1, 1)
+            alpha = image[1:2, :, :]
+            image = torch.cat((rgb, alpha), dim=0)
+        return image
+
+
 class ToBGR(torch.nn.Module):
     def forward(self, image: torch.Tensor) -> torch.Tensor:
         """Convert RGB image to BGR format.
@@ -289,6 +310,7 @@ def create_train_transform(
     transform_steps = [
         v2.ToImage(),
         v2.ToDtype(torch.float32, scale=True),  # Scale to [0, 1] for alpha blending
+        ToColorWithCheckIncluded(),  # Convert grayscale to RGB/RGBA if needed
         RgbaToRgbWithWhiteBackground(),  # Convert RGBA to RGB with white background
         PadToSquare([1.0, 1.0, 1.0]),  # Pad to square with white background
         v2.RandomHorizontalFlip(p=0.5),
@@ -358,6 +380,7 @@ def create_eval_transform(
         [
             v2.ToImage(),
             v2.ToDtype(torch.float32, scale=True),  # Scale to [0, 1] for alpha blending
+            ToColorWithCheckIncluded(),  # Convert grayscale to RGB/RGBA if needed
             RgbaToRgbWithWhiteBackground(),  # Convert RGBA to RGB with white background
             PadToSquare([1.0, 1.0, 1.0]),  # Pad to square with white background
             AreaResize(size=image_size),  # Use area interpolation for evaluation
