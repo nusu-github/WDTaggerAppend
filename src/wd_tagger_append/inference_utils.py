@@ -19,6 +19,13 @@ MODEL_REPO_MAP = {
     "eva02-large": "SmilingWolf/wd-eva02-large-tagger-v3",
 }
 
+CLASSIFIER_SKIP_MODULES: tuple[str, ...] = (
+    "head",
+    "head.fc",
+    "timm_model.head",
+    "timm_model.head.fc",
+)
+
 
 @dataclass
 class LabelData:
@@ -58,7 +65,9 @@ def _create_quantization_config() -> BitsAndBytesConfig:
     """Construct a BitsAndBytes quantization configuration for 8-bit loading."""
     return BitsAndBytesConfig(
         load_in_8bit=True,
-        llm_int8_skip_modules=["head"],
+        llm_int8_skip_modules=list(
+            CLASSIFIER_SKIP_MODULES,
+        ),
     )
 
 
@@ -130,7 +139,8 @@ def _load_label_data(
         elif fallback_repo is not None and not _is_local_path(fallback_repo):
             if warning_callback is not None:
                 warning_callback(
-                    f"selected_tags.csv not found locally; downloading labels from '{fallback_repo}'.",
+                    "selected_tags.csv not found locally; "
+                    f"downloading labels from '{fallback_repo}'.",
                 )
             base_labels = load_labels_hf(
                 repo_id=fallback_repo,

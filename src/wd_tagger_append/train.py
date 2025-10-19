@@ -42,6 +42,7 @@ from .dataset_utils import (
     determine_tag_categories,
     filter_tags_pandas,
     load_allowed_tags,
+    save_label_mapping_as_json,
     save_labels_as_csv,
 )
 from .inference_utils import MODEL_REPO_MAP, load_labels_hf
@@ -57,6 +58,40 @@ class DatasetSplits:
 
     train: Dataset
     eval: Dataset | None
+
+
+CLASSIFIER_SKIP_MODULES: tuple[str, ...] = (
+    "head",
+    "head.fc",
+    "timm_model.head",
+    "timm_model.head.fc",
+)
+
+
+_LORA_TARGET_MODULES: dict[str, tuple[str, ...]] = {
+    "eva02-large": ("q_proj", "k_proj", "v_proj", "proj", "fc1_g", "fc1_x", "fc2"),
+    "swinv2": ("qkv", "proj", "fc1", "fc2"),
+    "vit": ("qkv", "proj", "fc1", "fc2"),
+    "vit-large": ("qkv", "proj", "fc1", "fc2"),
+    "convnext": ("fc1", "fc2"),
+}
+
+
+def _resolve_lora_target_modules(model_key: str) -> list[str]:
+    """Return LoRA target module patterns tuned per backbone."""
+    patterns = _LORA_TARGET_MODULES.get(
+        model_key,
+        ("q_proj", "k_proj", "v_proj", "qkv", "proj", "fc1", "fc1_g", "fc1_x", "fc2"),
+    )
+    # Deduplicate while preserving order
+    seen: set[str] = set()
+    resolved: list[str] = []
+    for name in patterns:
+        if name in seen:
+            continue
+        seen.add(name)
+        resolved.append(name)
+    return resolved
 
 
 def _raise_bad_parameter(message: str, cause: Exception | None = None) -> NoReturn:
@@ -271,6 +306,7 @@ def _parse_precision(precision: str | None) -> tuple[bool, bool, torch.dtype | N
 def _create_quantization_config(
     in_4bit: bool,
     compute_dtype: torch.dtype | None,
+    skip_modules: Sequence[str],
 ) -> BitsAndBytesConfig:
     """Construct a BitsAndBytes quantization configuration if requested."""
     if in_4bit:
@@ -292,7 +328,7 @@ def _create_quantization_config(
 
     return BitsAndBytesConfig(
         load_in_8bit=True,
-        llm_int8_skip_modules=["head"],
+        llm_int8_skip_modules=list(skip_modules),
         llm_int8_has_fp16_weight=False,
     )
 
@@ -858,6 +894,10 @@ def main(
     save_labels_as_csv(label_list, tag_categories, csv_path)
     typer.echo(f"Saved labels as CSV to {csv_path}")
 
+    label_mapping_path = output_dir / "label_mapping.json"
+    save_label_mapping_as_json(label2id, label_mapping_path)
+    typer.echo(f"Saved label mapping to {label_mapping_path}")
+
     typer.echo("Initializing image processor pipelines...")
     image_processor = WDTaggerImageProcessor(pretrained_model_name_or_path=repo_id)
 
@@ -891,6 +931,7 @@ def main(
         quantization_config = _create_quantization_config(
             in_4bit=(quantization == "4bit"),
             compute_dtype=precision_dtype,
+            skip_modules=CLASSIFIER_SKIP_MODULES,
         )
         typer.echo(f"{quantization} quantization enabled.")
 
@@ -951,12 +992,13 @@ def main(
 
     classifier_module_name = _resolve_classifier_module(model)[1]
     modules_to_save = {classifier_module_name}
+    target_modules = _resolve_lora_target_modules(model_key.lower())
 
     lora_config = LoraConfig(
         r=lora_rank,
         lora_alpha=lora_alpha,
         lora_dropout=lora_dropout,
-        target_modules=["q_proj", "v_proj", "qkv", "fc1", "fc2"],
+        target_modules=target_modules,
         modules_to_save=sorted(modules_to_save),
         bias="none",
     )
