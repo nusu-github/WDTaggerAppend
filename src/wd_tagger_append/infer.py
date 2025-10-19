@@ -223,8 +223,11 @@ class BatchInferenceRunner:
         if not image_paths:
             return []
 
-        inputs = [Image.open(path) for path in image_paths]
-        model_inputs = self._pipeline.preprocess(inputs)
+        inputs = [
+            cast("torch.Tensor", self._pipeline.preprocess(Image.open(path)).get("pixel_values"))
+            for path in image_paths
+        ]
+        model_inputs = {"pixel_values": torch.cat(inputs, dim=0)}
 
         with torch.inference_mode():
             outputs = self._pipeline._forward(model_inputs)
