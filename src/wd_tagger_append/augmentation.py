@@ -5,9 +5,8 @@ augmentation pipelines matching the original TensorFlow preprocessing used to tr
 models. The utilities here are reused by both training and evaluation entrypoints.
 """
 
-from __future__ import annotations
-
-from typing import TYPE_CHECKING, Annotated, Any, TypedDict
+from collections.abc import Callable, Sequence
+from typing import Any, TypedDict
 
 import torch
 import torch.nn.functional as F
@@ -21,14 +20,7 @@ from transformers.image_utils import (
     valid_images,
     validate_kwargs,
 )
-from transformers.utils import logging
-
-logger = logging.get_logger(__name__)
-
-if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
-
-    from transformers.utils.generic import TensorType
+from transformers.utils.generic import TensorType
 
 
 class BatchItem(TypedDict):
@@ -39,27 +31,6 @@ class BatchItem(TypedDict):
 class PadParams(TypedDict):
     padding: list[int]
     needs_padding: bool
-
-
-class ToColorWithCheckIncluded(torch.nn.Module):
-    def forward(self, image: torch.Tensor) -> torch.Tensor:
-        """Convert grayscale image to RGB format if needed.
-
-        Args:
-            image: Input image tensor.
-
-        Returns:
-            Image in RGB format as Tensor.
-        """
-        if image.shape[0] == 1:
-            # Convert grayscale to RGB by repeating channels
-            image = image.repeat(3, 1, 1)
-        elif image.shape[0] == 2:
-            # Convert grayscale + alpha to RGBA by repeating channels
-            rgb = image[0:1, :, :].repeat(3, 1, 1)
-            alpha = image[1:2, :, :]
-            image = torch.cat((rgb, alpha), dim=0)
-        return image
 
 
 class ToBGR(torch.nn.Module):
@@ -78,7 +49,7 @@ class ToBGR(torch.nn.Module):
 class PadToSquare(v2.Transform):
     def __init__(
         self,
-        fill: v2._utils._FillType | dict[type | str, v2._utils._FillType] = 0,
+        fill: float | Sequence[float] = 0,
     ) -> None:
         """Initialize the transform with the desired padding fill value.
 
@@ -86,9 +57,9 @@ class PadToSquare(v2.Transform):
             fill: Padding value forwarded to ``torchvision.transforms.v2`` utilities.
         """
         super().__init__()
-        self.fill = v2._utils._setup_fill_arg(fill)
+        self.fill = fill
 
-    def make_params(self, flat_inputs: list[Any]) -> Annotated[dict[str, Any], PadParams]:
+    def make_params(self, flat_inputs: list[Any]) -> PadParams:
         """Compute symmetric padding required to make the image square.
 
         Args:
@@ -97,7 +68,7 @@ class PadToSquare(v2.Transform):
         Returns:
             Padding metadata consumed by :meth:`transform`.
         """
-        _, height, width = v2._utils.query_chw(flat_inputs[0])
+        _, height, width = TF.get_dimensions(flat_inputs[0])
         max_side = max(height, width)
         pad_height = max_side - height
         pad_width = max_side - width
@@ -110,7 +81,7 @@ class PadToSquare(v2.Transform):
         needs_padding = any(p > 0 for p in padding)
         return {"padding": padding, "needs_padding": needs_padding}
 
-    def transform(self, inpt: Any, params: Annotated[dict[str, Any], PadParams]) -> Any:
+    def transform(self, inpt: Any, params: PadParams) -> Any:
         """Apply the computed padding when the image is not already square.
 
         Args:
@@ -123,8 +94,7 @@ class PadToSquare(v2.Transform):
         if not params["needs_padding"]:
             return inpt
 
-        fill = v2._utils._get_fill(self.fill, type(inpt))
-        return TF.pad(inpt, padding=params["padding"], fill=fill)
+        return TF.pad(inpt, padding=params["padding"], fill=self.fill, padding_mode="constant")
 
 
 class RgbaToRgbWithWhiteBackground(torch.nn.Module):
@@ -155,18 +125,23 @@ class RgbaToRgbWithWhiteBackground(torch.nn.Module):
         if not was_batched:
             image = image.unsqueeze(0)
 
-        C = image.shape[1]
-        if C < 3:
-            msg = "expected at least 3 channels"
-            raise ValueError(msg)
-        if C == 3:
+        channels = image.shape[1]
+        if channels == 1:
+            rgb = TF.grayscale_to_rgb(image)
+            out = rgb
+        elif channels == 2:
+            luminance = image[:, :1, :, :]
+            alpha = image[:, 1:2, :, :]
+            rgb = TF.grayscale_to_rgb(luminance)
+            out = rgb * alpha + (1.0 - alpha)
+        elif channels == 3:
             out = image[:, :3, :, :]
-        elif C == 4:
+        elif channels >= 4:
             rgb = image[:, :3, :, :]
             alpha = image[:, 3:4, :, :]
             out = rgb * alpha + (1.0 - alpha)
         else:
-            msg = "expected 3 or 4 channels"
+            msg = "unexpected channel count"
             raise ValueError(msg)
         return out if was_batched else out.squeeze(0)
 
@@ -191,10 +166,7 @@ class AreaResize(torch.nn.Module):
     ) -> None:
         """Initialize AreaResize transform."""
         super().__init__()
-        if isinstance(size, int):
-            self.size = (size, size)
-        else:
-            self.size = tuple(size)
+        self.size = (size, size) if isinstance(size, int) else tuple(size)
 
     def forward(self, image: torch.Tensor) -> torch.Tensor:
         """Apply area interpolation resize to the input.
@@ -239,8 +211,7 @@ def _load_image_processor_stats(
         raise ValueError(error_hint) from exc
 
     required_keys = ("input_size", "mean", "std")
-    missing_keys = [key for key in required_keys if key not in pretrained_cfg]
-    if missing_keys:
+    if missing_keys := [key for key in required_keys if key not in pretrained_cfg]:
         msg = f"Configuration metadata is missing required keys: {', '.join(missing_keys)}."
         raise ValueError(
             msg,
@@ -321,7 +292,6 @@ def create_train_transform(
     transform_steps = [
         v2.ToImage(),
         v2.ToDtype(torch.float32, scale=True),  # Scale to [0, 1] for alpha blending
-        ToColorWithCheckIncluded(),  # Convert grayscale to RGB/RGBA if needed
         RgbaToRgbWithWhiteBackground(),  # Convert RGBA to RGB with white background
         PadToSquare([1.0, 1.0, 1.0]),  # Pad to square with white background
         v2.RandomHorizontalFlip(p=0.5),
@@ -391,7 +361,6 @@ def create_eval_transform(
         [
             v2.ToImage(),
             v2.ToDtype(torch.float32, scale=True),  # Scale to [0, 1] for alpha blending
-            ToColorWithCheckIncluded(),  # Convert grayscale to RGB/RGBA if needed
             RgbaToRgbWithWhiteBackground(),  # Convert RGBA to RGB with white background
             PadToSquare([1.0, 1.0, 1.0]),  # Pad to square with white background
             AreaResize(size=image_size),  # Use area interpolation for evaluation
@@ -465,7 +434,7 @@ class WDTaggerImageProcessor(BaseImageProcessor):
             )
         return self._eval_transform
 
-    def preprocess(  # pyright: ignore[reportIncompatibleMethodOverride]
+    def preprocess(
         self,
         images: ImageInput,
         do_train_augmentations: bool | None = None,
@@ -485,7 +454,7 @@ class WDTaggerImageProcessor(BaseImageProcessor):
 
         transform = self._get_train_transform() if use_train else self._get_eval_transform()
 
-        images = self.fetch_images(images)  # type: ignore
+        images = self.fetch_images(images)
         flat_images = make_flat_list_of_images(images)
 
         if not flat_images:
@@ -496,10 +465,7 @@ class WDTaggerImageProcessor(BaseImageProcessor):
             msg = "Invalid image type. Expected PIL, numpy array, or torch tensor inputs."
             raise ValueError(msg)
 
-        processed = [transform(image) for image in flat_images]  # type: ignore
-
-        if use_train:
-            logger.debug("Applied training augmentations in WDTaggerImageProcessor.")
+        processed = [transform(image) for image in flat_images]
 
         tensor_type_name = getattr(return_tensors, "value", return_tensors)
         if tensor_type_name == "pt":
@@ -557,9 +523,9 @@ def create_mixup_collate_fn(
         Returns:
             Tuple of (images, labels) with MixUp applied.
         """
-        # Extract images and labels
-        images = torch.stack([item["pixel_values"] for item in batch])
-        labels = torch.stack([item["labels"] for item in batch])
+        images, labels = default_collate(
+            [(item["pixel_values"], item["labels"]) for item in batch],
+        )
 
         # Apply MixUp (handles one-hot encoding internally if labels are 1D)
         images, labels = mixup(images, labels)

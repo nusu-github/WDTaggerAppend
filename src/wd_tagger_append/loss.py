@@ -4,7 +4,7 @@ from transformers.modeling_outputs import ImageClassifierOutput
 
 
 class AsymmetricLossMultiLabel(asymmetric_loss.AsymmetricLossMultiLabel):
-    def forward(self, x: ImageClassifierOutput, targets: torch.Tensor, **kwargs):  # pyright: ignore[reportIncompatibleMethodOverride]
+    def forward(self, x: ImageClassifierOutput, targets: torch.Tensor, **kwargs):
         # Extract num_items_in_batch if present (used for gradient accumulation)
         num_items_in_batch = kwargs.get("num_items_in_batch")
 

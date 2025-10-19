@@ -1,10 +1,8 @@
 """Shared utilities for loading WD Tagger models and label metadata."""
 
-from __future__ import annotations
-
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
@@ -12,9 +10,6 @@ import torch
 from huggingface_hub import hf_hub_download
 from huggingface_hub.errors import HfHubHTTPError
 from transformers import BitsAndBytesConfig
-
-if TYPE_CHECKING:
-    from collections.abc import Callable
 
 MODEL_REPO_MAP = {
     "swinv2": "SmilingWolf/wd-swinv2-tagger-v3",
@@ -48,11 +43,7 @@ def _load_labels_from_csv(csv_path: Path) -> LabelData:
 
 def _resolve_base_model_identifier(model: str, repo_override: str | None) -> str:
     """Resolve the base model repo or path from inputs."""
-    if repo_override:
-        return repo_override
-    if model in MODEL_REPO_MAP:
-        return MODEL_REPO_MAP[model]
-    return model
+    return repo_override or MODEL_REPO_MAP.get(model, model)
 
 
 def _is_local_path(source: str) -> bool:
@@ -63,7 +54,7 @@ def _is_local_path(source: str) -> bool:
         return False
 
 
-def _create_quantization_config() -> BitsAndBytesConfig | None:
+def _create_quantization_config() -> BitsAndBytesConfig:
     """Construct a BitsAndBytes quantization configuration for 8-bit loading."""
     return BitsAndBytesConfig(
         load_in_8bit=True,
@@ -107,10 +98,7 @@ def _load_csv_from_source(
 
     if _is_local_path(adapter):
         candidate = Path(adapter) / "selected_tags.csv"
-        if candidate.exists():
-            return candidate
-        return None
-
+        return candidate if candidate.exists() else None
     try:
         downloaded = hf_hub_download(
             repo_id=adapter,
@@ -201,32 +189,45 @@ def get_tags(
     char_threshold: float,
 ) -> tuple[str, str, dict[str, float], dict[str, float], dict[str, float]]:
     """Convert probabilities into caption/tag outputs."""
-    prob_values = probs.detach().cpu().numpy().tolist()
+    prob_values = probs.detach().cpu().numpy()
 
+    rating_indices = np.asarray(labels.rating, dtype=np.int64)
+    general_indices = np.asarray(labels.general, dtype=np.int64)
+    character_indices = np.asarray(labels.character, dtype=np.int64)
+
+    rating_scores = prob_values[rating_indices]
+    rating_sorted_order = np.argsort(rating_scores)[::-1] if rating_indices.size else rating_indices
+    rating_ordered_indices = (
+        rating_indices[rating_sorted_order] if rating_indices.size else rating_indices
+    )
     rating_labels: dict[str, float] = {
-        labels.names[i]: float(prob_values[i]) for i in labels.rating
+        labels.names[int(index)]: float(prob_values[int(index)]) for index in rating_ordered_indices
     }
 
-    general_candidates = [
-        (labels.names[i], float(prob_values[i]))
-        for i in labels.general
-        if prob_values[i] > gen_threshold
-    ]
-    gen_labels: dict[str, float] = dict(
-        sorted(general_candidates, key=lambda item: item[1], reverse=True),
-    )
+    general_scores = prob_values[general_indices]
+    general_mask = general_scores > gen_threshold
+    general_filtered_indices = general_indices[general_mask]
+    general_filtered_scores = general_scores[general_mask]
+    general_sorted_order = np.argsort(general_filtered_scores)[::-1]
+    general_ordered_indices = general_filtered_indices[general_sorted_order]
+    gen_labels = {
+        labels.names[int(index)]: float(prob_values[int(index)])
+        for index in general_ordered_indices
+    }
 
-    character_candidates = [
-        (labels.names[i], float(prob_values[i]))
-        for i in labels.character
-        if prob_values[i] > char_threshold
-    ]
-    char_labels: dict[str, float] = dict(
-        sorted(character_candidates, key=lambda item: item[1], reverse=True),
-    )
+    character_scores = prob_values[character_indices]
+    character_mask = character_scores > char_threshold
+    character_filtered_indices = character_indices[character_mask]
+    character_filtered_scores = character_scores[character_mask]
+    character_sorted_order = np.argsort(character_filtered_scores)[::-1]
+    character_ordered_indices = character_filtered_indices[character_sorted_order]
+    char_labels = {
+        labels.names[int(index)]: float(prob_values[int(index)])
+        for index in character_ordered_indices
+    }
 
-    combined_names = [name for name, _ in general_candidates]
-    combined_names.extend(name for name, _ in character_candidates)
+    combined_names = [labels.names[int(index)] for index in general_ordered_indices]
+    combined_names.extend(labels.names[int(index)] for index in character_ordered_indices)
 
     caption = ", ".join(combined_names)
     taglist = caption.replace("_", " ").replace("(", r"\(").replace(")", r"\)")

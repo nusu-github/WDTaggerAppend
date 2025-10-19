@@ -1,11 +1,10 @@
 """CLI for LoRA fine-tuning of WD tagger models using Hugging Face Trainer."""
 
-from __future__ import annotations
-
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import MethodType
-from typing import TYPE_CHECKING, Annotated, Any, Literal, NoReturn, cast
+from typing import Annotated, Any, Literal, NoReturn
 
 import torch
 import typer
@@ -20,9 +19,9 @@ from peft import (
 from peft.utils import ModulesToSaveWrapper
 from torch import Tensor, nn
 from transformers import (
-    AutoModelForImageClassification,
     BitsAndBytesConfig,
     DefaultDataCollator,
+    TimmWrapperForImageClassification,
     Trainer,
     TrainingArguments,
 )
@@ -30,12 +29,13 @@ from transformers.training_args import OptimizerNames
 from typer import BadParameter
 
 from datasets import Dataset, DatasetDict, concatenate_datasets, load_dataset, load_from_disk
-from wd_tagger_append.augmentation import (
+
+from .augmentation import (
     BatchItem,
     WDTaggerImageProcessor,
     create_mixup_collate_fn,
 )
-from wd_tagger_append.dataset_utils import (
+from .dataset_utils import (
     categorize_label_list,
     create_label_mapping,
     create_transform_function,
@@ -44,12 +44,9 @@ from wd_tagger_append.dataset_utils import (
     load_allowed_tags,
     save_labels_as_csv,
 )
-from wd_tagger_append.inference_utils import MODEL_REPO_MAP, load_labels_hf
-from wd_tagger_append.loss import AsymmetricLossMultiLabel
-from wd_tagger_append.metrics import DEFAULT_THRESHOLD, create_compute_metrics_fn
-
-if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Sequence
+from .inference_utils import MODEL_REPO_MAP, load_labels_hf
+from .loss import AsymmetricLossMultiLabel
+from .metrics import DEFAULT_THRESHOLD, create_compute_metrics_fn
 
 app = typer.Typer(help="Fine-tune WD tagger backbones with LoRA adapters.")
 
@@ -64,20 +61,20 @@ class DatasetSplits:
 
 def _raise_bad_parameter(message: str, cause: Exception | None = None) -> NoReturn:
     """Raise BadParameter with pyright-friendly typing."""
-    error = cast("Exception", BadParameter(message))
+    error = BadParameter(message)
     if cause is not None:
         error.__cause__ = cause
-    raise error  # pyright: ignore[reportGeneralTypeIssues]
+    raise error
 
 
 def _validate_dataset_inputs(dataset_path: Path | None, dataset_name: str | None) -> None:
     """Ensure exactly one dataset source is provided."""
     if dataset_path is None and dataset_name is None:
         msg = "Provide either --dataset-path or --dataset-name."
-        _raise_bad_parameter(msg)  # pyright: ignore[reportGeneralTypeIssues]
+        _raise_bad_parameter(msg)
     if dataset_path is not None and dataset_name is not None:
         msg = "Use only one of --dataset-path or --dataset-name."
-        _raise_bad_parameter(msg)  # pyright: ignore[reportGeneralTypeIssues]
+        _raise_bad_parameter(msg)
 
 
 def _validate_hub_inputs(
@@ -93,7 +90,7 @@ def _validate_hub_inputs(
     """
     if push_to_hub and hub_model_id is None:
         msg = "--hub-model-id is required when --push-to-hub is enabled."
-        _raise_bad_parameter(msg)  # pyright: ignore[reportGeneralTypeIssues]
+        _raise_bad_parameter(msg)
 
     if push_to_hub and output_dir.exists():
         git_dir = output_dir / ".git"
@@ -102,7 +99,7 @@ def _validate_hub_inputs(
                 f"When --push-to-hub is enabled and --output-dir '{output_dir}' exists, "
                 "it must be a valid git repository clone (containing .git directory)."
             )
-            _raise_bad_parameter(msg)  # pyright: ignore[reportGeneralTypeIssues]
+            _raise_bad_parameter(msg)
 
 
 def _load_dataset_from_source(
@@ -114,19 +111,18 @@ def _load_dataset_from_source(
     """Load dataset from disk or the Hugging Face Hub."""
     if dataset_path is not None:
         typer.echo(f"Loading dataset from disk: {dataset_path}")
-        return cast("Dataset | DatasetDict", load_from_disk(str(dataset_path)))
+        return load_from_disk(str(dataset_path))
 
     if dataset_name is None:
         msg = "Dataset name must be provided when dataset path is not used."
-        _raise_bad_parameter(msg)  # pyright: ignore[reportGeneralTypeIssues]
+        _raise_bad_parameter(msg)
 
     typer.echo(f"Loading dataset from Hugging Face Hub: {dataset_name}")
     try:
-        dataset = load_dataset(path=dataset_name, name=dataset_config, token=token)
-        return cast("Dataset | DatasetDict", dataset)
+        return load_dataset(path=dataset_name, name=dataset_config, token=token)
     except HfHubHTTPError as exc:
         msg = f"Failed to download dataset {dataset_name} (config={dataset_config})"
-        _raise_bad_parameter(msg, cause=exc)  # pyright: ignore[reportGeneralTypeIssues]
+        _raise_bad_parameter(msg, cause=exc)
 
 
 def _select_dataset_splits(
@@ -141,7 +137,7 @@ def _select_dataset_splits(
                 f"Train split '{train_split}' not present in dataset. "
                 f"Available: {list(dataset.keys())}"
             )
-            _raise_bad_parameter(msg)  # pyright: ignore[reportGeneralTypeIssues]
+            _raise_bad_parameter(msg)
         train_ds = dataset[train_split]
         eval_ds = None
         if eval_split is not None:
@@ -150,7 +146,7 @@ def _select_dataset_splits(
                     f"Eval split '{eval_split}' not present in dataset. "
                     f"Available: {list(dataset.keys())}"
                 )
-                _raise_bad_parameter(msg)  # pyright: ignore[reportGeneralTypeIssues]
+                _raise_bad_parameter(msg)
             eval_ds = dataset[eval_split]
         return DatasetSplits(train=train_ds, eval=eval_ds)
 
@@ -173,14 +169,14 @@ def _merge_label_lists(
     return merged
 
 
-def _resolve_classifier_module(model: AutoModelForImageClassification) -> tuple[nn.Linear, str]:
+def _resolve_classifier_module(model: TimmWrapperForImageClassification) -> tuple[nn.Linear, str]:
     """Return classifier module and its dotted path."""
-    head = model.timm_model.head  # type: ignore[union-attr]
+    head = model.timm_model.head
     base_path = "timm_model.head"
     if hasattr(head, "fc"):
-        if isinstance(head.fc, nn.Linear):  # type: ignore[attr-defined]
+        if isinstance(head.fc, nn.Linear):
             return head.fc, f"{base_path}.fc"
-        msg = f"Classifier head fc is not Linear: {type(head.fc)}"  # type: ignore[attr-defined]
+        msg = f"Classifier head fc is not Linear: {type(head.fc)}"
         raise ValueError(msg)
     if isinstance(head, nn.Linear):
         return head, base_path
@@ -190,14 +186,14 @@ def _resolve_classifier_module(model: AutoModelForImageClassification) -> tuple[
 
 def _resolve_peft_module(model: PeftModel) -> tuple[nn.Linear, str]:
     """Return classifier module and its dotted path from a PEFT model."""
-    head = model.base_model.model.timm_model.head  # type: ignore[union-attr]
-    base_path = "base_model.model.timm_model.head"
-
+    head = model.base_model.model.timm_model.head
     if isinstance(head, ModulesToSaveWrapper):
         if isinstance(head.modules_to_save, nn.ModuleDict):
             default_module = head.modules_to_save["default"]
             if isinstance(default_module, nn.Linear):
-                return cast("nn.Linear", default_module), f"{base_path}.modules_to_save.default"
+                base_path = "base_model.model.timm_model.head"
+
+                return default_module, f"{base_path}.modules_to_save.default"
             msg = (
                 f"PEFT classifier modules_to_save['default'] is not Linear: {type(default_module)}"
             )
@@ -209,15 +205,15 @@ def _resolve_peft_module(model: PeftModel) -> tuple[nn.Linear, str]:
 
 
 def _expand_classification_head(
-    model: AutoModelForImageClassification,
+    model: TimmWrapperForImageClassification,
     base_labels: Sequence[str],
     target_labels: Sequence[str],
     dtype: torch.dtype | None,
 ) -> None:
     """Expand classification head to match target labels, copying known weights."""
     classifier, classifier_path = _resolve_classifier_module(model)
-    in_features = classifier.in_features  # type: ignore[assignment]
-    old_out_features = classifier.out_features  # type: ignore[assignment]
+    in_features = classifier.in_features
+    old_out_features = classifier.out_features
     new_out_features = len(target_labels)
     if old_out_features == new_out_features:
         typer.echo("Classification head already matches target label count.")
@@ -228,8 +224,8 @@ def _expand_classification_head(
         f"{old_out_features} -> {new_out_features} outputs.",
     )
 
-    device = classifier.weight.device  # type: ignore[assignment]
-    use_bias = classifier.bias is not None  # type: ignore[assignment]
+    device = classifier.weight.device
+    use_bias = classifier.bias is not None
     new_head = nn.Linear(in_features, new_out_features, bias=use_bias)
 
     if dtype is not None:
@@ -241,19 +237,19 @@ def _expand_classification_head(
         for target_idx, label in enumerate(target_labels):
             if label in base_index and base_index[label] < old_out_features:
                 source_idx = base_index[label]
-                new_head.weight[target_idx].copy_(classifier.weight[source_idx])  # type: ignore[index]
+                new_head.weight[target_idx].copy_(classifier.weight[source_idx])
                 if use_bias:
-                    new_head.bias[target_idx].copy_(classifier.bias[source_idx])  # type: ignore[index]
+                    new_head.bias[target_idx].copy_(classifier.bias[source_idx])
             else:
                 nn.init.normal_(new_head.weight[target_idx], mean=0.0, std=0.02)
                 if use_bias:
                     nn.init.zeros_(new_head.bias[target_idx])
 
-    head = model.timm_model.head  # type: ignore[union-attr]
+    head = model.timm_model.head
     if hasattr(head, "fc"):
         head.fc = new_head
     else:
-        model.timm_model.head = new_head  # type: ignore[assignment]
+        model.timm_model.head = new_head
 
 
 def _parse_precision(precision: str | None) -> tuple[bool, bool, torch.dtype | None]:
@@ -269,7 +265,7 @@ def _parse_precision(precision: str | None) -> tuple[bool, bool, torch.dtype | N
     if precision.lower() == "fp16":
         return False, True, torch.float16
     msg = "Precision must be one of: fp32, bf16, fp16."
-    _raise_bad_parameter(msg)  # pyright: ignore[reportGeneralTypeIssues]
+    _raise_bad_parameter(msg)
 
 
 def _create_quantization_config(
@@ -806,12 +802,12 @@ def main(
             msg = (
                 f"No tags found in {allowed_tags_file}. Provide a file containing at least one tag."
             )
-            _raise_bad_parameter(msg)  # pyright: ignore[reportGeneralTypeIssues]
+            _raise_bad_parameter(msg)
 
     # Filter new tags using Pandas-optimized function
     # This replaces multiple dict comprehensions with a single vectorized operation
     filtered_new_tags = filter_tags_pandas(
-        tag_frequencies=new_tags_frequencies,  # pyright: ignore[reportArgumentType]
+        tag_frequencies=new_tags_frequencies,
         base_label_set=base_label_set,
         tag_categories=dataset_tag_categories,
         selected_categories=selected_categories,
@@ -899,7 +895,7 @@ def main(
         typer.echo(f"{quantization} quantization enabled.")
 
     typer.echo(f"Loading pretrained model: {repo_id}")
-    model = AutoModelForImageClassification.from_pretrained(
+    model = TimmWrapperForImageClassification.from_pretrained(
         repo_id,
         revision=base_revision,
         dtype=precision_dtype,
@@ -976,7 +972,7 @@ def main(
         )
 
         # Get the classifier head (works with both timm_model.head and timm_model.head.fc)
-        classifier, _ = _resolve_peft_module(model)  # pyright: ignore[reportArgumentType]
+        classifier, _ = _resolve_peft_module(model)
 
         # Create and register hooks for weight and bias
         weight_hook = _create_gradient_mask_hook(num_base_labels)

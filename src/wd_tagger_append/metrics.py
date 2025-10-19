@@ -3,18 +3,11 @@
 This module provides metric computation functions compatible with Hugging Face Trainer.
 """
 
-from __future__ import annotations
-
-from typing import TYPE_CHECKING
+from collections.abc import Callable
 
 import torch
 from torchmetrics.classification import AUROC, F1Score, MatthewsCorrCoef, Precision, Recall
-
-if TYPE_CHECKING:
-    from collections.abc import Callable
-
-    from transformers import EvalPrediction
-
+from transformers import EvalPrediction
 
 # Default threshold from JAX-CV implementation
 DEFAULT_THRESHOLD = 0.4

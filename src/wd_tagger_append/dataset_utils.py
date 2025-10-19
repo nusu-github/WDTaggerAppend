@@ -1,24 +1,20 @@
 """Dataset utility functions for WD Tagger training.
 
 This module provides utilities for label encoding, dataset transformation,
-and integration with training pipelines using Pandas vectorized operations.
+and integration with training pipelines using standard library primitives.
 """
 
-from __future__ import annotations
-
+import csv
 import json
 import numbers
 from collections import Counter
-from typing import TYPE_CHECKING, Any
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
+from pathlib import Path
+from typing import Any
 
-import pandas as pd
 import torch
 
-if TYPE_CHECKING:
-    from collections.abc import Callable, Collection, Mapping, Sequence
-    from pathlib import Path
-
-    from datasets import Dataset
+from datasets import ClassLabel, Dataset
 
 VALID_TAG_CATEGORIES: tuple[str, ...] = ("rating", "general", "character")
 
@@ -42,8 +38,7 @@ def _validate_categories(categories: Sequence[str] | None) -> tuple[str, ...]:
     if categories is None:
         return ("general", "character")
 
-    invalid = [category for category in categories if category not in VALID_TAG_CATEGORIES]
-    if invalid:
+    if invalid := [category for category in categories if category not in VALID_TAG_CATEGORIES]:
         invalid_str = ", ".join(sorted(invalid))
         msg = f"Unsupported tag categories: {invalid_str}"
         raise ValueError(msg)
@@ -57,6 +52,25 @@ def _validate_categories(categories: Sequence[str] | None) -> tuple[str, ...]:
         seen.add(category)
 
     return tuple(normalized)
+
+
+def _iter_metadata(dataset: Dataset | Iterable[Mapping[str, Any]]) -> Iterable[Mapping[str, Any]]:
+    """Yield metadata dictionaries without materializing large intermediate objects."""
+    if isinstance(dataset, Dataset):
+        columns_to_drop = [col for col in ("image",) if col in dataset.column_names]
+        working_dataset = dataset.remove_columns(columns_to_drop) if columns_to_drop else dataset
+        rating_feature = working_dataset.features.get("rating")
+
+        for example in working_dataset:
+            if isinstance(rating_feature, ClassLabel):
+                rating_value = example.get("rating")
+                if isinstance(rating_value, numbers.Integral):
+                    example = dict(example)
+                    example["rating"] = rating_feature.int2str(int(rating_value))
+            yield example
+        return
+
+    yield from dataset
 
 
 def _normalize_rating_value(value: Any) -> str | None:
@@ -79,10 +93,7 @@ def _normalize_rating_value(value: Any) -> str | None:
         return None
 
     candidate = value.strip()
-    if not candidate:
-        return None
-
-    return RATING_CODE_TO_NAME.get(candidate, candidate)
+    return RATING_CODE_TO_NAME.get(candidate, candidate) if candidate else None
 
 
 def load_allowed_tags(path: Path) -> set[str]:
@@ -98,113 +109,63 @@ def load_allowed_tags(path: Path) -> set[str]:
 
 
 def count_tag_frequencies(
-    dataset: Dataset,
+    dataset: Dataset | Iterable[Mapping[str, Any]],
     categories: Sequence[str] | None = None,
 ) -> Counter[str]:
-    """Count tag occurrences using Pandas vectorized operations.
-
-    Uses:
-    - Pandas DataFrame.explode() for tag expansion
-    - Pandas value_counts() for counting
-    - Batch processing without Python-level iteration
-
-    Args:
-        dataset: Dataset containing tags in nested structure.
-        categories: Tag categories to consider.
-
-    Returns:
-        Counter mapping tags to frequencies.
-    """
+    """Count tag occurrences using Counter instead of Pandas."""
     active_categories = _validate_categories(categories)
+    counts: Counter[str] = Counter()
 
-    # Convert to Pandas DataFrame (zero-copy from Arrow)
-    # Don't decode images - we only need metadata
-    df: pd.DataFrame = dataset.remove_columns("image").to_pandas()  # type: ignore
+    for example in _iter_metadata(dataset):
+        tags = example.get("tags") or {}
 
-    all_tags: list[str] = []
+        if "general" in active_categories:
+            counts.update(tag for tag in tags.get("general", []) if tag)
 
-    # Extract general tags using Pandas explode
-    if "general" in active_categories:
-        general_tags_series = df["tags"].apply(
-            lambda x: x.get("general", []) if isinstance(x, dict) else [],
-        )
-        # Explode list of lists into flat series
-        general_series: pd.Series = general_tags_series.explode()  # type: ignore
-        all_tags.extend(general_series[general_series.notna()].tolist())
+        if "character" in active_categories:
+            counts.update(tag for tag in tags.get("character", []) if tag)
 
-    # Extract character tags using Pandas explode
-    if "character" in active_categories:
-        character_tags_series = df["tags"].apply(
-            lambda x: x.get("character", []) if isinstance(x, dict) else [],
-        )
-        character_series: pd.Series = character_tags_series.explode()  # type: ignore
-        all_tags.extend(character_series[character_series.notna()].tolist())
+        if "rating" in active_categories:
+            if normalized := _normalize_rating_value(example.get("rating")):
+                counts.update((normalized,))
 
-    # Extract rating tags
-    if "rating" in active_categories:
-        rating_tags_series: pd.Series = df["rating"].apply(_normalize_rating_value)  # type: ignore
-        all_tags.extend(rating_tags_series[rating_tags_series.notna()].tolist())
-
-    # Count occurrences
-    return Counter(all_tags)
+    return counts
 
 
 def determine_tag_categories(
-    dataset: Dataset,
+    dataset: Dataset | Iterable[Mapping[str, Any]],
     categories: Sequence[str] | None = None,
 ) -> dict[str, str]:
-    """Determine which category each tag belongs to using Pandas operations.
-
-    For tags appearing in multiple categories, the first occurrence wins
-    (priority: rating > general > character).
-
-    All tags are processed in a single DataFrame pass without repetition.
-
-    Args:
-        dataset: Dataset containing tags in nested structure.
-        categories: Iterable of tag categories to consider.
-
-    Returns:
-        Dictionary mapping tag names to category names.
-    """
+    """Determine which category each tag belongs to without repeated Pandas operations."""
     active_categories = _validate_categories(categories)
 
-    # Convert to Pandas DataFrame (zero-copy from Arrow)
-    df: pd.DataFrame = dataset.remove_columns("image").to_pandas()  # type: ignore
+    rating_tags: set[str] = set()
+    general_tags: set[str] = set()
+    character_tags: set[str] = set()
 
-    tags_with_categories: list[tuple[str, str]] = []
+    for example in _iter_metadata(dataset):
+        tags = example.get("tags") or {}
 
-    # Collect all tags with their categories - priority: rating > general > character
-    if "rating" in active_categories:
-        rating_tags_series: pd.Series = df["rating"].apply(_normalize_rating_value)  # type: ignore
-        rating_exploded: pd.Series = (
-            rating_tags_series[rating_tags_series.notna()].drop_duplicates()  # type: ignore
-        )
-        tags_with_categories.extend([(tag, "rating") for tag in rating_exploded])
+        if "rating" in active_categories:
+            if normalized := _normalize_rating_value(example.get("rating")):
+                rating_tags.add(normalized)
 
-    if "general" in active_categories:
-        general_tags_series = df["tags"].apply(
-            lambda x: x.get("general", []) if isinstance(x, dict) else [],
-        )
-        general_exploded: pd.Series = general_tags_series.explode()[
-            general_tags_series.explode().notna()
-        ].drop_duplicates()  # type: ignore
-        tags_with_categories.extend([(tag, "general") for tag in general_exploded])
+        if "general" in active_categories:
+            general_tags.update(tag for tag in tags.get("general", []) if tag)
 
-    if "character" in active_categories:
-        character_tags_series = df["tags"].apply(
-            lambda x: x.get("character", []) if isinstance(x, dict) else [],
-        )
-        character_exploded: pd.Series = character_tags_series.explode()[
-            character_tags_series.explode().notna()
-        ].drop_duplicates()  # type: ignore
-        tags_with_categories.extend([(tag, "character") for tag in character_exploded])
+        if "character" in active_categories:
+            character_tags.update(tag for tag in tags.get("character", []) if tag)
 
-    # Create mapping with priority: first occurrence wins
     tag_to_category: dict[str, str] = {}
-    for tag, category in tags_with_categories:
-        if tag not in tag_to_category:
-            tag_to_category[tag] = category
+    for tag_set, category in (
+        (rating_tags, "rating"),
+        (general_tags, "general"),
+        (character_tags, "character"),
+    ):
+        if category not in active_categories:
+            continue
+        for tag in tag_set:
+            tag_to_category.setdefault(tag, category)
 
     return tag_to_category
 
@@ -217,79 +178,49 @@ def filter_tags_pandas(
     min_count: int = 1,
     allowed_tags: Collection[str] | None = None,
 ) -> dict[str, int]:
-    """Filter and categorize tags using Pandas DataFrame operations.
+    """Filter tags using plain dictionaries for clarity and safety."""
+    if min_count < 1:
+        return {}
 
-    Combines multiple filtering steps in a single vectorized operation instead
-    of chaining multiple dictionary comprehensions.
+    allowed_lookup = set(allowed_tags) if allowed_tags is not None else None
+    selected_lookup = set(selected_categories)
 
-    Args:
-        tag_frequencies: Mapping of tags to frequencies (dict or Counter).
-        base_label_set: Set of base model tags to exclude.
-        tag_categories: Dictionary mapping tag names to category names.
-        selected_categories: Categories to include (rating, general, character).
-        min_count: Minimum occurrence count for new tags.
-        allowed_tags: Optional allow list for new tags.
-
-    Returns:
-        Dictionary mapping new tags to their counts.
-    """
-    # Convert to DataFrame for vectorized operations
-    df = pd.DataFrame(
-        list(tag_frequencies.items()),
-        columns=["tag", "count"],
-    )
-
-    # Filter: exclude base tags
-    df = df[~df["tag"].isin(base_label_set)]
-
-    # Map categories
-    df["category"] = df["tag"].map(tag_categories)
-
-    # Filter: keep selected categories
-    df = df[df["category"].isin(selected_categories)]
-
-    # Filter: min count
-    df = df[df["count"] >= min_count]
-
-    # Filter: allowed tags if specified
-    if allowed_tags is not None:
-        df = df[df["tag"].isin(allowed_tags)]
-
-    return dict(zip(df["tag"], df["count"], strict=False))
+    result: dict[str, int] = {}
+    for tag, count in tag_frequencies.items():
+        if tag in base_label_set:
+            continue
+        category = tag_categories.get(tag)
+        if category not in selected_lookup:
+            continue
+        if count < min_count:
+            continue
+        if allowed_lookup is not None and tag not in allowed_lookup:
+            continue
+        result[tag] = count
+    return result
 
 
 def create_label_mapping(
-    dataset: Dataset,
+    dataset: Dataset | Iterable[Mapping[str, Any]],
     categories: Sequence[str] | None = None,
     *,
     min_count: int = 1,
     allowed_tags: Collection[str] | None = None,
 ) -> tuple[dict[str, int], Counter[str]]:
-    """Create label mapping using Pandas for frequency counting.
-
-    Args:
-        dataset: Dataset containing tags in nested structure.
-        categories: Iterable of tag categories to consider.
-        min_count: Minimum number of occurrences required to keep a tag.
-        allowed_tags: Optional allow list restricting tags to the provided set.
-
-    Returns:
-        Tuple of (label_mapping, tag_frequencies).
-    """
+    """Create label mapping using Counter for frequency counting."""
     if min_count < 1:
         msg = "min_count must be >= 1"
         raise ValueError(msg)
 
     active_categories = _validate_categories(categories)
-
-    # Count frequencies with Pandas
     frequencies = count_tag_frequencies(dataset, active_categories)
 
-    # Filter and sort
+    allowed_lookup = set(allowed_tags) if allowed_tags is not None else None
+
     filtered_tags = [
         tag
         for tag, count in frequencies.items()
-        if count >= min_count and (allowed_tags is None or tag in allowed_tags)
+        if count >= min_count and (allowed_lookup is None or tag in allowed_lookup)
     ]
 
     sorted_tags = sorted(filtered_tags)
@@ -303,42 +234,23 @@ def categorize_label_list(
     base_label_indices: dict[str, set[str]],
     dataset_tag_categories: dict[str, str],
 ) -> dict[str, list[str]]:
-    """Categorize labels using Pandas for vectorized operations.
+    """Categorize labels without relying on Pandas."""
+    result: dict[str, list[str]] = {"rating": [], "general": [], "character": []}
 
-    Splits labels into rating, general, and character categories using
-    base model categories first, then dataset categories for new tags.
+    rating_base = base_label_indices.get("rating", set())
+    character_base = base_label_indices.get("character", set())
+    general_base = base_label_indices.get("general", set())
 
-    Args:
-        label_list: Ordered list of all label names.
-        base_label_indices: Dict mapping category names to sets of base label names.
-            Example: {"rating": {"safe", "explicit"}, "general": {...}, ...}
-        dataset_tag_categories: Dict mapping tag names to category names for new tags.
-
-    Returns:
-        Dictionary mapping category names to lists of tags.
-    """
-    # Convert to DataFrame for vectorized operations
-    df = pd.DataFrame(
-        {"tag": label_list},
-    )
-
-    # Check base categories first (priority: rating > character > general)
-    def categorize_tag(tag: str) -> str:
-        if tag in base_label_indices.get("rating", set()):
-            return "rating"
-        if tag in base_label_indices.get("character", set()):
-            return "character"
-        if tag in base_label_indices.get("general", set()):
-            return "general"
-        # New tags: use dataset category
-        return dataset_tag_categories.get(tag, "general")
-
-    df["category"] = df["tag"].apply(categorize_tag)
-
-    # Group tags by category
-    result: dict[str, list[str]] = {}
-    for category in ["rating", "general", "character"]:
-        result[category] = df[df["category"] == category]["tag"].tolist()
+    for tag in label_list:
+        if tag in rating_base:
+            category = "rating"
+        elif tag in character_base:
+            category = "character"
+        elif tag in general_base:
+            category = "general"
+        else:
+            category = dataset_tag_categories.get(tag, "general")
+        result.setdefault(category, []).append(tag)
 
     return result
 
@@ -348,16 +260,9 @@ def save_labels_as_csv(
     tag_categories: dict[str, list[str]],
     output_path: Path,
 ) -> None:
-    """Save labels in WD Tagger v3 compatible CSV format (selected_tags.csv).
-
-    Args:
-        label_list: Ordered list of all label names.
-        tag_categories: Dictionary mapping category names to lists of tags in that category.
-        output_path: Path to save the CSV file.
-    """
+    """Save labels in WD Tagger v3 compatible CSV format (selected_tags.csv)."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Build category lookup
     tag_to_category: dict[str, int] = {}
     for category_name, tags in tag_categories.items():
         category_code = CATEGORY_MAP.get(category_name)
@@ -366,43 +271,32 @@ def save_labels_as_csv(
         for tag in tags:
             tag_to_category[tag] = category_code
 
-    # Write CSV using Pandas
-    df = pd.DataFrame(
-        {
-            "tag_id": list(range(len(label_list))),
-            "name": label_list,
-            "category": [tag_to_category.get(tag, CATEGORY_MAP["general"]) for tag in label_list],
-            "count": [0] * len(label_list),  # Placeholder; not computed from dataset
-        },
-    )
-
-    df.to_csv(output_path, index=False)
+    with output_path.open("w", encoding="utf-8", newline="") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=["tag_id", "name", "category", "count"])
+        writer.writeheader()
+        for idx, tag in enumerate(label_list):
+            writer.writerow(
+                {
+                    "tag_id": idx,
+                    "name": tag,
+                    "category": tag_to_category.get(tag, CATEGORY_MAP["general"]),
+                    "count": 0,
+                },
+            )
 
 
 def save_label_mapping_as_json(
     label_mapping: dict[str, int],
     output_path: Path,
 ) -> None:
-    """Save label mapping as JSON for inference compatibility.
-
-    Args:
-        label_mapping: Dictionary mapping tag strings to indices.
-        output_path: Path to save the JSON file.
-    """
+    """Save label mapping as JSON for inference compatibility."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as f:
         json.dump(label_mapping, f, indent=2, ensure_ascii=False)
 
 
 def load_label_mapping_from_json(path: Path) -> dict[str, int]:
-    """Load label mapping from JSON.
-
-    Args:
-        path: Path to the JSON file.
-
-    Returns:
-        Dictionary mapping tag strings to indices.
-    """
+    """Load label mapping from JSON."""
     with path.open(encoding="utf-8") as f:
         return json.load(f)
 
@@ -414,17 +308,7 @@ def encode_multi_labels(
     *,
     rating_value: Any | None = None,
 ) -> torch.Tensor:
-    """Encode tags as a multi-hot vector respecting category filters.
-
-    Args:
-        tags_dict: Dictionary with 'general' and 'character' keys containing tag lists.
-        label_mapping: Dictionary mapping tag strings to indices.
-        categories: Sequence of categories to include.
-        rating_value: Optional rating value to encode.
-
-    Returns:
-        Multi-hot encoded tensor of shape (num_labels,).
-    """
+    """Encode tags as a multi-hot vector respecting category filters."""
     num_classes = len(label_mapping)
     labels = torch.zeros(num_classes, dtype=torch.float32)
 
@@ -455,35 +339,13 @@ def create_transform_function(
     label_mapping: dict[str, int],
     categories: Sequence[str],
 ) -> Callable:
-    """Create a batched transform function for Dataset.set_transform.
-
-    Transforms are applied on-the-fly without intermediate dataset creation.
-    Supports data augmentation that varies per epoch.
-
-    Args:
-        transform: Transform function to apply to images (from augmentation.py).
-        label_mapping: Dictionary mapping tag strings to indices.
-        categories: Sequence of tag categories to encode.
-
-    Returns:
-        Transform function compatible with Dataset.set_transform.
-    """
+    """Create a batched transform function for Dataset.set_transform."""
     active_categories = _validate_categories(categories)
 
     def transform_function(examples: dict) -> dict:
-        """Apply transforms and encode labels in batch.
-
-        Args:
-            examples: Batch of examples from the dataset.
-
-        Returns:
-            Transformed examples with pixel_values and labels.
-        """
-        # Apply image transforms (vectorized if possible)
         images = [transform(img) for img in examples["image"]]
         examples["pixel_values"] = torch.stack(images)
 
-        # Encode multi-labels
         ratings = examples.get("rating", [None] * len(examples["tags"]))
         labels = []
 
@@ -499,7 +361,6 @@ def create_transform_function(
 
         examples["labels"] = torch.stack(labels)
 
-        # Remove unnecessary fields to save memory
         for key in ["image", "md5", "source", "score", "rating", "tags"]:
             examples.pop(key, None)
 
@@ -509,44 +370,30 @@ def create_transform_function(
 
 
 def get_dataset_statistics(
-    dataset: Dataset,
+    dataset: Dataset | Iterable[Mapping[str, Any]],
 ) -> dict[str, Any]:
-    """Compute statistics about the dataset using Pandas vectorized operations.
+    """Compute statistics about the dataset without relying on Pandas."""
+    num_examples = 0
+    total_general = 0
+    total_character = 0
+    rating_counts: Counter[str] = Counter()
 
-    Uses zero-copy conversion to Pandas from Arrow.
-    All operations use vectorized Pandas methods without Python-level iteration.
-
-    Args:
-        dataset: Dataset to analyze.
-
-    Returns:
-        Dictionary containing dataset statistics.
-    """
-    # Convert to Pandas DataFrame (zero-copy from Arrow)
-    df: pd.DataFrame = dataset.remove_columns("image").to_pandas()  # type: ignore
+    for example in _iter_metadata(dataset):
+        num_examples += 1
+        tags = example.get("tags") or {}
+        total_general += len(tags.get("general", []) or [])
+        total_character += len(tags.get("character", []) or [])
+        if normalized := _normalize_rating_value(example.get("rating")):
+            rating_counts.update((normalized,))
 
     stats: dict[str, Any] = {
-        "num_examples": len(df),
-        "tag_counts": {"general": 0, "character": 0, "rating": 0},
-        "rating_distribution": {},
+        "num_examples": num_examples,
+        "tag_counts": {
+            "general": total_general,
+            "character": total_character,
+            "rating": int(sum(rating_counts.values())),
+        },
+        "rating_distribution": dict(rating_counts),
     }
-
-    # Count general tags (vectorized)
-    general_tags_series: pd.Series = df["tags"].apply(  # type: ignore
-        lambda x: len(x.get("general", [])) if isinstance(x, dict) else 0,
-    )
-    stats["tag_counts"]["general"] = int(general_tags_series.sum())
-
-    # Count character tags (vectorized)
-    character_tags_series: pd.Series = df["tags"].apply(  # type: ignore
-        lambda x: len(x.get("character", [])) if isinstance(x, dict) else 0,
-    )
-    stats["tag_counts"]["character"] = int(character_tags_series.sum())
-
-    # Count rating tags and distribution (vectorized)
-    rating_tags_series: pd.Series = df["rating"].apply(_normalize_rating_value)  # type: ignore
-    rating_counts: pd.Series = rating_tags_series.value_counts()  # type: ignore
-    stats["tag_counts"]["rating"] = int(rating_counts.sum())
-    stats["rating_distribution"] = rating_counts.to_dict()
 
     return stats

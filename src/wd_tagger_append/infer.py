@@ -1,22 +1,20 @@
-from __future__ import annotations
-
-import os
-import re
 import shutil
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
+from pathlib import Path
+from typing import Annotated, Any, Literal
 
+import pandas as pd
 import torch
 import typer
+from pathvalidate import sanitize_filename
 from peft import PeftConfig, PeftModel
 from PIL import Image
-from torch.nn import functional as F
-from transformers import (
-    AutoModelForImageClassification,
-)
+from transformers import TimmWrapperForImageClassification, pipeline
+from transformers.pipelines import ImageClassificationPipeline
 
-from wd_tagger_append.augmentation import WDTaggerImageProcessor
-from wd_tagger_append.inference_utils import (
+from .augmentation import WDTaggerImageProcessor
+from .inference_utils import (
     MODEL_REPO_MAP,
     LabelData,
     _create_quantization_config,
@@ -27,20 +25,7 @@ from wd_tagger_append.inference_utils import (
     get_tags,
 )
 
-if TYPE_CHECKING:
-    from collections.abc import Iterable
-    from pathlib import Path
-
-IMAGE_EXTENSIONS = {
-    ".jpg",
-    ".jpeg",
-    ".png",
-    ".webp",
-    ".bmp",
-    ".gif",
-    ".tif",
-    ".tiff",
-}
+IMAGE_EXTENSIONS = Image.registered_extensions().keys()
 
 
 @dataclass
@@ -53,40 +38,23 @@ class InferenceResult:
     general: dict[str, float]
 
 
-_SANITIZE_PATTERN = re.compile(r"[<>:\"/\\|?*\n\r]+")
-
-
-def _move_inputs_to_model_device(model: torch.nn.Module, inputs: torch.Tensor) -> torch.Tensor:
-    device_attr = getattr(model, "device", None)
-    if isinstance(device_attr, torch.device):
-        return inputs.to(device=device_attr)
-    try:
-        first_param = next(model.parameters())
-        return inputs.to(device=first_param.device)
-    except StopIteration:
-        return inputs.to(device="cpu")
-
-
 def _infer_single_image(
     image_path: Path,
-    model: torch.nn.Module,
-    image_processor: WDTaggerImageProcessor,
+    inference_pipeline: ImageClassificationPipeline,
     labels: LabelData,
     gen_threshold: float,
     char_threshold: float,
 ) -> InferenceResult:
-    with Image.open(image_path) as img_input:
-        batch = image_processor(images=img_input, return_tensors="pt")
-
-    inputs = batch["pixel_values"]
-    inputs = _move_inputs_to_model_device(model, inputs)
+    model_inputs = inference_pipeline.preprocess(str(image_path))
 
     with torch.inference_mode():
-        logits = model(inputs).logits
-        probs = F.sigmoid(logits)
+        model_outputs = inference_pipeline._forward(model_inputs)
+
+    logits = model_outputs["logits"].to("cpu").squeeze(0)
+    probs = torch.sigmoid(logits)
 
     caption, taglist, ratings, character, general = get_tags(
-        probs=probs.to("cpu").squeeze(0),
+        probs=probs,
         labels=labels,
         gen_threshold=gen_threshold,
         char_threshold=char_threshold,
@@ -116,20 +84,10 @@ def _extract_tag_names(
     rating_threshold: float,
 ) -> list[str]:
     if category == "rating":
-        return [
-            name
-            for name, score in sorted(
-                result.ratings.items(),
-                key=lambda item: item[1],
-                reverse=True,
-            )
-            if score >= rating_threshold
-        ]
+        return [name for name, score in result.ratings.items() if score >= rating_threshold]
     if category == "character":
         return list(result.character.keys())
-    if category == "general":
-        return list(result.general.keys())
-    return []
+    return list(result.general.keys()) if category == "general" else []
 
 
 def _format_tag_list(names: Iterable[str]) -> str:
@@ -138,11 +96,12 @@ def _format_tag_list(names: Iterable[str]) -> str:
 
 
 def _sanitize_folder_name(name: str) -> str:
-    sanitized = name.replace(os.sep, "_")
-    if os.altsep:
-        sanitized = sanitized.replace(os.altsep, "_")
-    sanitized = _SANITIZE_PATTERN.sub("_", sanitized)
-    sanitized = sanitized.strip().strip(".")
+    sanitized = sanitize_filename(
+        name or "no_tag",
+        replacement_text="_",
+        platform="universal",
+    ).strip()
+    sanitized = sanitized.strip(".")
     return sanitized or "no_tag"
 
 
@@ -153,28 +112,30 @@ def _write_text_results(
     rating_threshold: float,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", encoding="utf-8") as handle:
-        for result in results:
-            try:
-                relative_path = result.image_path.relative_to(base_dir)
-            except ValueError:
-                relative_path = result.image_path
+    records: list[dict[str, str]] = []
+    for result in results:
+        try:
+            relative_path = result.image_path.relative_to(base_dir)
+        except ValueError:
+            relative_path = result.image_path
 
-            rating_names = _format_tag_list(
-                _extract_tag_names(result, "rating", rating_threshold),
-            )
-            character_names = _format_tag_list(
-                _extract_tag_names(result, "character", rating_threshold),
-            )
-            general_names = _format_tag_list(
-                _extract_tag_names(result, "general", rating_threshold),
-            )
+        records.append(
+            {
+                "image": str(relative_path),
+                "ratings": _format_tag_list(
+                    _extract_tag_names(result, "rating", rating_threshold),
+                ),
+                "character": _format_tag_list(
+                    _extract_tag_names(result, "character", rating_threshold),
+                ),
+                "general": _format_tag_list(
+                    _extract_tag_names(result, "general", rating_threshold),
+                ),
+            },
+        )
 
-            line = (
-                f"{relative_path}, Ratings: {rating_names}, "
-                f"Character: {character_names}, General: {general_names}\n"
-            )
-            handle.write(line)
+    df = pd.DataFrame.from_records(records, columns=["image", "ratings", "character", "general"])
+    df.to_csv(output_path, index=False)
 
 
 def _organize_files(
@@ -258,8 +219,7 @@ def _print_single_result(
 
 def _process_directory(
     image_dir: Path,
-    model: torch.nn.Module,
-    image_processor: WDTaggerImageProcessor,
+    inference_pipeline: ImageClassificationPipeline,
     labels: LabelData,
     gen_threshold: float,
     char_threshold: float,
@@ -282,8 +242,7 @@ def _process_directory(
         try:
             result = _infer_single_image(
                 image_path=path,
-                model=model,
-                image_processor=image_processor,
+                inference_pipeline=inference_pipeline,
                 labels=labels,
                 gen_threshold=gen_threshold,
                 char_threshold=char_threshold,
@@ -308,7 +267,7 @@ def _process_directory(
         typer.echo(f"Wrote directory results to {output_path}")
     elif dir_output in {"copy", "move"}:
         dest_root = dir_destination or (image_dir / f"sorted_by_{dir_category}")
-        mode = cast("Literal['copy', 'move']", dir_output)
+        mode = dir_output
         processed, skipped = _organize_files(
             results,
             dest_root=dest_root,
@@ -477,8 +436,8 @@ def main(
         typer.echo(f"Error: Path must be a file or directory: {image_path}", err=True)
         raise typer.Exit(code=1)
 
-    dir_output = cast("Literal['text', 'copy', 'move', 'none']", dir_output.lower())
-    dir_category = cast("Literal['rating', 'character', 'general']", dir_category.lower())
+    dir_output = dir_output.lower()
+    dir_category = dir_category.lower()
 
     adapter_token_final = adapter_token or token
     base_identifier = _resolve_base_model_identifier(model, repo_id)
@@ -491,7 +450,7 @@ def main(
             revision=adapter_revision,
             token=adapter_token_final,
         )
-        adapter_base = cast("str", peft_config.base_model_name_or_path)
+        adapter_base = peft_config.base_model_name_or_path
         if repo_id is None and model in MODEL_REPO_MAP:
             base_identifier = adapter_base
         typer.echo(
@@ -541,7 +500,7 @@ def main(
     base_kwargs["ignore_mismatched_sizes"] = True
 
     typer.echo(f"Loading base model from '{base_identifier}' with {num_labels} labels...")
-    hf_model = AutoModelForImageClassification.from_pretrained(
+    hf_model = TimmWrapperForImageClassification.from_pretrained(
         base_identifier,
         **base_kwargs,
     )
@@ -560,11 +519,17 @@ def main(
     typer.echo("Creating data transform...")
     image_processor = WDTaggerImageProcessor(base_identifier)
 
+    typer.echo("Setting up inference pipeline...")
+    inference_pipeline = pipeline(
+        task="image-classification",
+        model=hf_model,
+        image_processor=image_processor,
+    )
+
     if image_path.is_dir():
         _process_directory(
             image_dir=image_path,
-            model=hf_model,
-            image_processor=image_processor,
+            inference_pipeline=inference_pipeline,
             labels=labels,
             gen_threshold=gen_threshold,
             char_threshold=char_threshold,
@@ -581,8 +546,7 @@ def main(
     typer.echo("Loading image and preprocessing...")
     result = _infer_single_image(
         image_path=image_path,
-        model=hf_model,
-        image_processor=image_processor,
+        inference_pipeline=inference_pipeline,
         labels=labels,
         gen_threshold=gen_threshold,
         char_threshold=char_threshold,

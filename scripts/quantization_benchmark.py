@@ -1,238 +1,466 @@
-"""Quantization error measurement tool for WD Tagger models.
+"""Quantization benchmark CLI for WD Tagger models.
 
-This script loads a dataset (local images or Hugging Face dataset) and
-measures the quantization error when using 4-bit or 8-bit quantized models
-compared to FP32 baseline.
-
-Usage:
-    # Local image directory
-    uv run pytest tests/test.py --dataset-path /path/to/images
-
-    # Hugging Face dataset
-    uv run pytest tests/test.py --dataset-name user/dataset-name
-
-    # Specific quantization method
-    uv run pytest tests/test.py --dataset-path /path --quantization 8bit
+This entry point compares a reference FP32 model against a BitsAndBytes quantized
+variant across a sample of images drawn from a local directory or a Hugging Face
+dataset. The script reuses the project image processor to ensure preprocessing
+matches training and inference pipelines and reports agreement metrics built on
+torchmetrics.
 """
 
 from __future__ import annotations
 
-import argparse
+from dataclasses import dataclass
+from itertools import islice
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Annotated, Literal, cast
 
-import numpy as np
 import torch
+import typer
 from PIL import Image
-from transformers import AutoImageProcessor, AutoModelForImageClassification, BitsAndBytesConfig
+from torchmetrics import MeanAbsoluteError
+from torchmetrics.classification import MultilabelExactMatch, MultilabelHammingDistance
+from transformers import AutoModelForImageClassification, BitsAndBytesConfig
+
+from datasets import Dataset, IterableDataset, load_dataset
+from wd_tagger_append.augmentation import WDTaggerImageProcessor
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Iterable, Iterator
+
+app = typer.Typer(add_completion=False)
+
+IMAGE_EXTENSIONS = {ext.lower() for ext in Image.registered_extensions()}
 
 
-def _collect_images(dataset_path: Path) -> Iterator[Image.Image]:
-    """Load images from local directory or Hugging Face dataset."""
-    if not dataset_path.exists():
-        msg = f"Dataset path not found: {dataset_path}"
-        raise FileNotFoundError(msg)
-
-    if dataset_path.is_dir():
-        image_extensions = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
-        image_files = [f for f in dataset_path.rglob("*") if f.suffix.lower() in image_extensions]
-
-        if not image_files:
-            msg = f"No images found in {dataset_path}"
-            raise ValueError(msg)
-
-        for image_file in sorted(image_files):
-            try:
-                img = Image.open(image_file).convert("RGB")
-                yield img
-            except Exception as e:
-                print(f"Warning: Failed to load {image_file}: {e}")
-    else:
-        msg = f"Expected directory, got file: {dataset_path}"
-        raise ValueError(msg)
+@dataclass
+class BenchmarkInputs:
+    processor: WDTaggerImageProcessor
+    model_fp32: AutoModelForImageClassification
+    model_quantized: AutoModelForImageClassification
+    threshold: float
+    topk_ratio: float
+    batch_size: int
+    max_samples: int | None
 
 
-def _measure_quantization_error(
-    model_fp32: AutoModelForImageClassification,
-    model_quantized: AutoModelForImageClassification,
-    image_processor: AutoImageProcessor,
-    images: list[Image.Image],
-    threshold: float = 0.35,
-) -> dict:
-    """Measure quantization error across images."""
-    all_probs_fp32 = []
-    all_probs_quantized = []
-
-    for img in images:
-        inputs = image_processor(images=[img], return_tensors="pt")
-        pixel_values = inputs["pixel_values"].to(model_fp32.device)
-
-        with torch.no_grad():
-            outputs_fp32 = model_fp32(pixel_values)
-            logits_fp32 = outputs_fp32.logits
-            probs_fp32 = torch.sigmoid(logits_fp32).cpu().numpy()
-
-            outputs_quantized = model_quantized(pixel_values)
-            logits_quantized = outputs_quantized.logits
-            probs_quantized = torch.sigmoid(logits_quantized).cpu().numpy()
-
-        all_probs_fp32.append(probs_fp32)
-        all_probs_quantized.append(probs_quantized)
-
-    all_probs_fp32 = np.vstack(all_probs_fp32)
-    all_probs_quantized = np.vstack(all_probs_quantized)
-
-    prob_diff = np.abs(all_probs_quantized - all_probs_fp32)
-
-    results = {
-        "num_images": len(images),
-        "num_labels": all_probs_fp32.shape[1],
-        "max_prob_diff": prob_diff.max(),
-        "mean_prob_diff": prob_diff.mean(),
-        "std_prob_diff": prob_diff.std(),
-        "p95_prob_diff": np.percentile(prob_diff, 95),
-        "p99_prob_diff": np.percentile(prob_diff, 99),
-    }
-
-    top_k = max(1, int(all_probs_fp32.shape[1] * 0.1))
-    top_k_indices_fp32 = np.argsort(all_probs_fp32, axis=1)[:, -top_k:]
-    top_k_indices_quantized = np.argsort(all_probs_quantized, axis=1)[:, -top_k:]
-    per_row_match = [
-        np.intersect1d(a, b).size / top_k
-        for a, b in zip(top_k_indices_fp32, top_k_indices_quantized, strict=False)
-    ]
-    results["top_10_percent_match_rate"] = float(np.mean(per_row_match))
-
-    tags_fp32 = (all_probs_fp32 > threshold).astype(int)
-    tags_quantized = (all_probs_quantized > threshold).astype(int)
-    exact_matches = (tags_fp32 == tags_quantized).all(axis=1)
-    results["exact_match_rate"] = exact_matches.mean()
-
-    hamming_distance = np.abs(tags_fp32 - tags_quantized).sum(axis=1)
-    results["mean_hamming_distance"] = hamming_distance.mean()
-    results["max_hamming_distance"] = hamming_distance.max()
-    results["hamming_loss"] = hamming_distance.mean() / all_probs_fp32.shape[1]
-
-    return results
+@dataclass
+class BenchmarkResult:
+    samples: int
+    num_labels: int
+    prob_mae: float
+    prob_max: float
+    prob_std: float
+    prob_p95: float
+    prob_p99: float
+    topk_match_rate: float
+    exact_match_rate: float
+    hamming_distance: float
 
 
-def main() -> None:
-    """Run quantization error measurement."""
-    parser = argparse.ArgumentParser(
-        description="Measure quantization error for WD Tagger models on a dataset.",
-    )
-    parser.add_argument(
-        "--dataset-path",
-        type=Path,
-        required=True,
-        help="Path to local image directory",
-    )
-    parser.add_argument(
-        "--model",
-        type=str,
-        default="SmilingWolf/wd-eva02-large-tagger-v3",
-        help="Model ID from Hugging Face Hub",
-    )
-    parser.add_argument(
-        "--quantization",
-        choices=["4bit", "8bit"],
-        default="4bit",
-        help="Quantization method to test",
-    )
-    parser.add_argument(
-        "--max-images",
-        type=int,
-        default=10,
-        help="Maximum number of images to process",
-    )
-    parser.add_argument(
-        "--threshold",
-        type=float,
-        default=0.35,
-        help="Tag confidence threshold for predictions",
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="auto",
-        help="Device to use (auto, cuda, cpu)",
-    )
+def _resolve_device(device_option: str) -> torch.device:
+    if device_option == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(device_option)
 
-    args = parser.parse_args()
 
-    print(f"Loading images from {args.dataset_path}...")
-    images = []
-    for image_path in _collect_images(args.dataset_path):
-        images.append(image_path)
-        if len(images) >= args.max_images:
-            break
-    print(f"Loaded {len(images)} images")
+def _resolve_device_map(device_option: str) -> str:
+    return "auto" if device_option == "auto" else device_option
 
-    print(f"Loading image processor: {args.model}")
-    image_processor = AutoImageProcessor.from_pretrained(args.model)
 
-    print(f"Loading FP32 model: {args.model}")
-    model_fp32 = AutoModelForImageClassification.from_pretrained(
-        args.model,
-        device_map=args.device,
-    ).eval()
-
-    print(f"Loading {args.quantization} quantized model: {args.model}")
-    if args.quantization == "4bit":
-        quantization_config = BitsAndBytesConfig(
+def _build_quantization_config(mode: Literal["4bit", "8bit"]) -> BitsAndBytesConfig:
+    if mode == "4bit":
+        return BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
             bnb_4bit_use_double_quant=True,
             bnb_4bit_compute_dtype=torch.float16,
         )
-    else:
-        quantization_config = BitsAndBytesConfig(
+    if mode == "8bit":
+        return BitsAndBytesConfig(
             load_in_8bit=True,
             llm_int8_skip_modules=["head"],
             llm_int8_has_fp16_weight=False,
         )
+    msg = "Quantization mode must be either '4bit' or '8bit'."
+    raise typer.BadParameter(msg)
 
-    model_quantized = AutoModelForImageClassification.from_pretrained(
-        args.model,
-        device_map=args.device,
-        quantization_config=quantization_config,
-    ).eval()
 
-    print("\nMeasuring quantization error...")
-    results = _measure_quantization_error(
-        model_fp32=model_fp32,
-        model_quantized=model_quantized,
-        image_processor=image_processor,
-        images=images,
-        threshold=args.threshold,
+def _batched(iterable: Iterable[Image.Image], batch_size: int) -> Iterator[list[Image.Image]]:
+    iterator = iter(iterable)
+    while True:
+        if batch := list(islice(iterator, batch_size)):
+            yield batch
+        else:
+            break
+
+
+def _iter_local_images(root: Path) -> Iterator[Image.Image]:
+    if not root.exists():
+        msg = f"Dataset path not found: {root}"
+        raise typer.BadParameter(msg)
+    if not root.is_dir():
+        msg = f"Expected directory, got file: {root}"
+        raise typer.BadParameter(msg)
+
+    image_files = sorted(
+        path
+        for path in root.rglob("*")
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+    )
+    if not image_files:
+        msg = f"No images found in {root}"
+        raise typer.BadParameter(msg)
+
+    for path in image_files:
+        try:
+            with Image.open(path) as img:
+                yield img.convert("RGB")
+        except (OSError, ValueError) as exc:
+            typer.echo(f"Skipping '{path}': {exc}", err=True)
+
+
+def _iter_hf_dataset(
+    dataset: Dataset | IterableDataset,
+    image_column: str,
+) -> Iterator[Image.Image]:
+    for record in dataset:
+        image_data = record[image_column]
+        if isinstance(image_data, Image.Image):
+            yield image_data.convert("RGB")
+        else:
+            yield Image.fromarray(image_data).convert("RGB")
+
+
+def _collect_image_iterator(
+    dataset_path: Path | None,
+    dataset_name: str | None,
+    dataset_config: str | None,
+    dataset_split: str,
+    image_column: str,
+    streaming: bool,
+) -> Iterator[Image.Image]:
+    if dataset_path is not None and dataset_name is not None:
+        msg = "Use either --dataset-path or --dataset-name, not both."
+        raise typer.BadParameter(msg)
+    if dataset_path is None and dataset_name is None:
+        msg = "Provide --dataset-path for local files or --dataset-name for Hugging Face datasets."
+        raise typer.BadParameter(msg)
+
+    if dataset_path is not None:
+        return _iter_local_images(dataset_path)
+
+    dataset = load_dataset(
+        path=dataset_name,
+        name=dataset_config,
+        split=dataset_split,
+        streaming=streaming,
+    )
+    if image_column not in dataset.column_names:
+        msg = f"Column '{image_column}' not present in dataset."
+        raise typer.BadParameter(msg)
+    return _iter_hf_dataset(dataset, image_column=image_column)
+
+
+def _run_benchmark(
+    image_iterator: Iterator[Image.Image],
+    inputs: BenchmarkInputs,
+    device: torch.device,
+) -> BenchmarkResult:
+    model_fp32 = inputs.model_fp32.to(device)
+    model_fp32.eval()
+    model_quantized = inputs.model_quantized
+    model_quantized.eval()
+
+    mae_metric = MeanAbsoluteError()
+    hamming_metric: MultilabelHammingDistance | None = None
+    exact_metric: MultilabelExactMatch | None = None
+
+    prob_diffs: list[torch.Tensor] = []
+    topk_match_sum = 0.0
+    processed_samples = 0
+    num_labels = None
+    topk_ratio = inputs.topk_ratio
+    batch_size = inputs.batch_size
+    max_samples = inputs.max_samples
+
+    def _take_limited_batches() -> Iterator[list[Image.Image]]:
+        if max_samples is None:
+            yield from _batched(image_iterator, batch_size)
+            return
+
+        remaining = max_samples
+        for batch in _batched(image_iterator, batch_size):
+            if remaining <= 0:
+                break
+            if len(batch) > remaining:
+                yield batch[:remaining]
+                break
+            yield batch
+            remaining -= len(batch)
+
+    for batch in _take_limited_batches():
+        if not batch:
+            continue
+
+        batch_inputs = inputs.processor(images=batch, return_tensors="pt")
+        pixel_values = batch_inputs["pixel_values"].to(device)
+
+        with torch.inference_mode():
+            logits_fp32 = model_fp32(pixel_values).logits
+            logits_quantized = model_quantized(pixel_values).logits
+
+        probs_fp32 = torch.sigmoid(logits_fp32).detach().cpu()
+        probs_quantized = torch.sigmoid(logits_quantized).detach().cpu()
+
+        if num_labels is None:
+            num_labels = probs_fp32.shape[1]
+            hamming_metric = MultilabelHammingDistance(
+                num_labels=num_labels,
+                threshold=inputs.threshold,
+            )
+            exact_metric = MultilabelExactMatch(
+                num_labels=num_labels,
+                threshold=inputs.threshold,
+            )
+
+        mae_metric.update(probs_quantized, probs_fp32)
+        hamming_metric.update(probs_quantized, probs_fp32)
+        exact_metric.update(probs_quantized, probs_fp32)
+
+        diff = (probs_quantized - probs_fp32).abs()
+        prob_diffs.append(diff)
+
+        k = max(1, int(topk_ratio * probs_fp32.shape[1]))
+        topk_indices_fp32 = torch.topk(probs_fp32, k, dim=1).indices
+        topk_indices_quantized = torch.topk(probs_quantized, k, dim=1).indices
+        for indices_fp32, indices_quantized in zip(
+            topk_indices_fp32,
+            topk_indices_quantized,
+            strict=False,
+        ):
+            overlap = torch.isin(indices_fp32, indices_quantized).sum().item()
+            topk_match_sum += overlap / k
+
+        processed_samples += probs_fp32.shape[0]
+
+    if (
+        processed_samples == 0
+        or num_labels is None
+        or hamming_metric is None
+        or exact_metric is None
+    ):
+        msg = "No images were processed. Check dataset inputs."
+        raise typer.BadParameter(msg)
+
+    diff_tensor = torch.cat([tensor.flatten() for tensor in prob_diffs])
+    prob_mae = float(mae_metric.compute())
+    prob_max = float(diff_tensor.max())
+    prob_std = float(diff_tensor.std(unbiased=False))
+    prob_p95 = float(torch.quantile(diff_tensor, 0.95))
+    prob_p99 = float(torch.quantile(diff_tensor, 0.99))
+
+    return BenchmarkResult(
+        samples=processed_samples,
+        num_labels=num_labels,
+        prob_mae=prob_mae,
+        prob_max=prob_max,
+        prob_std=prob_std,
+        prob_p95=prob_p95,
+        prob_p99=prob_p99,
+        topk_match_rate=topk_match_sum / processed_samples,
+        exact_match_rate=float(exact_metric.compute()),
+        hamming_distance=float(hamming_metric.compute()),
     )
 
-    print("\n" + "=" * 60)
-    print(f"Quantization Error Report ({args.quantization})")
-    print("=" * 60)
-    print(f"Images processed: {results['num_images']}")
-    print(f"Label dimensions: {results['num_labels']}")
-    print()
-    print("Probability Space Errors:")
-    print(f"  Max difference: {results['max_prob_diff']:.6f}")
-    print(f"  Mean difference: {results['mean_prob_diff']:.6f}")
-    print(f"  Std deviation: {results['std_prob_diff']:.6f}")
-    print(f"  95th percentile: {results['p95_prob_diff']:.6f}")
-    print(f"  99th percentile: {results['p99_prob_diff']:.6f}")
-    print()
-    print("Tag Prediction Agreement:")
-    print(f"  Top-10% match rate: {results['top_10_percent_match_rate']:.4f}")
-    print(f"  Exact match rate: {results['exact_match_rate']:.4f}")
-    print()
-    print(f"Hamming Distance (tag threshold={args.threshold:.2f}):")
-    print(f"  Mean distance: {results['mean_hamming_distance']:.2f} tags")
-    print(f"  Max distance: {results['max_hamming_distance']:.0f} tags")
-    print(f"  Hamming loss: {results['hamming_loss']:.6f} ({results['hamming_loss'] * 100:.4f}%)")
-    print("=" * 60)
+
+@app.command()
+def main(
+    model: Annotated[
+        str,
+        typer.Option(
+            "--model",
+            help="Model identifier, repository, or local path.",
+        ),
+    ] = "SmilingWolf/wd-eva02-large-tagger-v3",
+    quantization: Annotated[
+        Literal["4bit", "8bit"],
+        typer.Option(
+            "--quantization",
+            case_sensitive=False,
+            help="BitsAndBytes quantization mode to benchmark.",
+        ),
+    ] = "4bit",
+    dataset_path: Annotated[
+        Path | None,
+        typer.Option(
+            "--dataset-path",
+            path_type=Path,
+            help="Directory of images to evaluate.",
+        ),
+    ] = None,
+    dataset_name: Annotated[
+        str | None,
+        typer.Option(
+            "--dataset-name",
+            help="Hugging Face dataset name to evaluate.",
+        ),
+    ] = None,
+    dataset_config: Annotated[
+        str | None,
+        typer.Option(
+            "--dataset-config",
+            help="Optional dataset configuration.",
+        ),
+    ] = None,
+    dataset_split: Annotated[
+        str,
+        typer.Option(
+            "--dataset-split",
+            help="Dataset split for Hugging Face datasets.",
+        ),
+    ] = "train",
+    image_column: Annotated[
+        str,
+        typer.Option(
+            "--image-column",
+            help="Column containing images in the dataset.",
+        ),
+    ] = "image",
+    threshold: Annotated[
+        float,
+        typer.Option(
+            "--threshold",
+            min=0.0,
+            max=1.0,
+            help="Threshold applied when comparing tag activations.",
+        ),
+    ] = 0.35,
+    topk_ratio: Annotated[
+        float,
+        typer.Option(
+            "--topk-ratio",
+            min=0.0,
+            max=1.0,
+            help="Fraction of labels used for the top-k match rate.",
+        ),
+    ] = 0.1,
+    batch_size: Annotated[
+        int,
+        typer.Option(
+            "--batch-size",
+            min=1,
+            help="Batch size for inference.",
+        ),
+    ] = 4,
+    max_samples: Annotated[
+        int | None,
+        typer.Option(
+            "--max-samples",
+            help="Maximum number of images to process. Defaults to all available samples.",
+        ),
+    ] = None,
+    device: Annotated[
+        str,
+        typer.Option(
+            "--device",
+            help="Device for the FP32 model ('auto', 'cuda', 'cpu', ...).",
+        ),
+    ] = "auto",
+    revision: Annotated[
+        str | None,
+        typer.Option(
+            "--revision",
+            help="Model revision or commit SHA.",
+        ),
+    ] = None,
+    token: Annotated[
+        str | None,
+        typer.Option(
+            "--token",
+            help="Authentication token for private models or datasets.",
+        ),
+    ] = None,
+    streaming: Annotated[
+        bool,
+        typer.Option(
+            "--streaming/--no-streaming",
+            help="Enable streaming mode when loading Hugging Face datasets.",
+        ),
+    ] = False,
+) -> None:
+    if not 0.0 < topk_ratio <= 1.0:
+        msg = "--topk-ratio must be between 0 and 1."
+        raise typer.BadParameter(msg)
+
+    device_resolved = _resolve_device(device)
+    device_map = _resolve_device_map(device)
+
+    typer.echo(f"Loading image processor for '{model}'...")
+    processor = WDTaggerImageProcessor(
+        pretrained_model_name_or_path=model,
+        do_train_augmentations=False,
+    )
+
+    typer.echo("Loading FP32 reference model...")
+    model_fp32 = AutoModelForImageClassification.from_pretrained(
+        model,
+        revision=revision,
+        token=token,
+        low_cpu_mem_usage=True,
+    )
+
+    typer.echo(f"Loading {quantization} quantized model...")
+    quantization_mode = cast("Literal['4bit', '8bit']", quantization.lower())
+    quantization_config = _build_quantization_config(quantization_mode)
+    model_quantized = AutoModelForImageClassification.from_pretrained(
+        model,
+        revision=revision,
+        token=token,
+        quantization_config=quantization_config,
+        device_map=device_map,
+        low_cpu_mem_usage=True,
+    )
+
+    image_iterator = _collect_image_iterator(
+        dataset_path=dataset_path,
+        dataset_name=dataset_name,
+        dataset_config=dataset_config,
+        dataset_split=dataset_split,
+        image_column=image_column,
+        streaming=streaming,
+    )
+
+    inputs = BenchmarkInputs(
+        processor=processor,
+        model_fp32=model_fp32,
+        model_quantized=model_quantized,
+        threshold=threshold,
+        topk_ratio=topk_ratio,
+        batch_size=batch_size,
+        max_samples=max_samples,
+    )
+
+    result = _run_benchmark(
+        image_iterator=image_iterator,
+        inputs=inputs,
+        device=device_resolved,
+    )
+
+    typer.echo("\n================ Quantization Benchmark ================")
+    typer.echo(f"Samples processed: {result.samples}")
+    typer.echo(f"Number of labels: {result.num_labels}")
+    typer.echo("\nProbability differences")
+    typer.echo(f"  Mean absolute difference: {result.prob_mae:.6f}")
+    typer.echo(f"  Maximum difference: {result.prob_max:.6f}")
+    typer.echo(f"  Standard deviation: {result.prob_std:.6f}")
+    typer.echo(f"  95th percentile: {result.prob_p95:.6f}")
+    typer.echo(f"  99th percentile: {result.prob_p99:.6f}")
+    typer.echo("\nClassification agreement")
+    typer.echo(f"  Top-k match rate: {result.topk_match_rate:.4f}")
+    typer.echo(f"  Exact match rate: {result.exact_match_rate:.4f}")
+    typer.echo(f"  Mean Hamming distance: {result.hamming_distance:.4f}")
+    typer.echo("========================================================")
 
 
 if __name__ == "__main__":
-    main()
+    app()
