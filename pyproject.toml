@@ -78,7 +78,7 @@ schedulefree = ["schedulefree>=1.4.1"]
 dev = ["pyright>=1.1.405", "pytest>=8.4.2", "ruff>=0.13.0"]
 
 [tool.ruff]
-include = ["src/**/*.py", "tests/**/*.py"]
+include = ["src/**/*.py", "tests/**/*.py", "scripts/**/*.py"]
 extend-exclude = []
 line-length = 100
 target-version = "py311"
@@ -103,4 +103,4 @@ line-ending = "lf"
 convention = "google"
 
 [tool.pyright]
-include = ["src", "tests"]
+include = ["src", "tests", "scripts"]

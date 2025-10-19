@@ -10,7 +10,13 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal, NoReturn, cast
 import torch
 import typer
 from huggingface_hub.errors import HfHubHTTPError
-from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
+from peft import (
+    LoraConfig,
+    PeftModel,
+    cast_mixed_precision_params,
+    get_peft_model,
+    prepare_model_for_kbit_training,
+)
 from peft.utils import ModulesToSaveWrapper
 from torch import Tensor, nn
 from transformers import (
@@ -274,13 +280,13 @@ def _create_quantization_config(
 ) -> BitsAndBytesConfig:
     """Construct a BitsAndBytes quantization configuration if requested."""
     if in_4bit:
-        # Four-bit quantization is intended for testing purposes only.
-        # During testing, the error rate for the top 10% of predictions was approximately 10%,
-        # with a maximum error rate of about 20%. Use at least 8 bits in production environments.
+        # Four-bit quantization reduces numeric precision. This config loads parameters in 4-bit
+        # using nf4 with double quantization. Evaluate task-specific impact separately
+        # (e.g., scripts/quantization_benchmark.py) and choose precision accordingly.
         typer.echo(
-            "Caution: Using 4-bit quantization significantly reduces precision. "
-            "Use it only for testing purposes. "
-            "Recommended: 8-bit or fp16/bf16 for production.",
+            "Caution: 4-bit quantization reduces numeric precision. "
+            "Use primarily for testing. "
+            "Prefer 8-bit or fp16/bf16 when accuracy sensitivity matters.",
             err=True,
         )
         return BitsAndBytesConfig(
@@ -873,7 +879,7 @@ def main(
 
     bf16, fp16, precision_dtype = _parse_precision(precision)
     quantization_config = None
-    if quantization:
+    if quantization in {"8bit", "4bit"}:
         quantization_config = _create_quantization_config(
             in_4bit=(quantization == "4bit"),
             compute_dtype=precision_dtype,
@@ -890,7 +896,19 @@ def main(
     )
     image_processor = AutoImageProcessor.from_pretrained(repo_id, revision=base_revision)
 
-    if quantization:
+    _expand_classification_head(
+        model=model,
+        base_labels=base_labels,
+        target_labels=label_list,
+        dtype=precision_dtype,
+    )
+    model.config.label2id = label2id
+    model.config.id2label = id2label
+    model.config.num_labels = len(label_list)
+
+    if bf16 or fp16:
+        cast_mixed_precision_params(model, dtype=precision_dtype)
+    elif quantization_config:
 
         def get_input_embeddings(self) -> nn.Module:
             base_model = model_key.lower()
@@ -919,20 +937,10 @@ def main(
         model.get_input_embeddings = MethodType(get_input_embeddings, model)
         model.set_input_embeddings = MethodType(set_input_embeddings, model)
 
-        model = prepare_model_for_kbit_training(model)
-
-    _expand_classification_head(
-        model=model,
-        base_labels=base_labels,
-        target_labels=label_list,
-        dtype=precision_dtype,
-    )
-    model.config.label2id = label2id
-    model.config.id2label = id2label
-    model.config.num_labels = len(label_list)
-
-    if gradient_checkpointing:
-        model.gradient_checkpointing_enable()
+        model = prepare_model_for_kbit_training(
+            model,
+            use_gradient_checkpointing=gradient_checkpointing,
+        )
 
     classifier_module_name = _resolve_classifier_module(model)[1]
     modules_to_save = {classifier_module_name}
