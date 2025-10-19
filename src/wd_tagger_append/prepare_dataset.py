@@ -7,8 +7,7 @@ into Hugging Face Datasets format using Pandas for batch processing.
 from __future__ import annotations
 
 import json
-from pathlib import Path
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 
 import pandas as pd
 import PIL.Image
@@ -16,6 +15,9 @@ import typer
 
 from datasets import ClassLabel, Dataset, DatasetDict, Features, Image, Sequence, Value
 from wd_tagger_append.dataset_utils import RATING_CODE_TO_NAME
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 app = typer.Typer(help="Prepare WD Tagger datasets from image folders")
 

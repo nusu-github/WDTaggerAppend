@@ -30,18 +30,17 @@ class PadParams(TypedDict):
     needs_padding: bool
 
 
-class ToBGR(v2.Transform):
-    def transform(self, inpt: Any, params: dict[str, Any]) -> Any:  # noqa: ARG002
+class ToBGR(torch.nn.Module):
+    def forward(self, image: torch.Tensor) -> torch.Tensor:
         """Convert RGB image to BGR format.
 
         Args:
-            inpt: Input image (Tensor, PIL Image, or other compatible format)
-            params: Transform parameters (unused)
+            image: Input image tensor in RGB format.
 
         Returns:
             Image in BGR format as Tensor.
         """
-        return TF.permute_channels(inpt, permutation=[2, 1, 0])
+        return TF.permute_channels(image, permutation=[2, 1, 0])
 
 
 class PadToSquare(v2.Transform):
@@ -96,7 +95,7 @@ class PadToSquare(v2.Transform):
         return TF.pad(inpt, padding=params["padding"], fill=fill)
 
 
-class RgbaToRgbWithWhiteBackground(v2.Transform):
+class RgbaToRgbWithWhiteBackground(torch.nn.Module):
     """Convert RGBA image to RGB by alpha-blending with white background.
 
     This transform converts RGBA images to RGB by blending transparent areas
@@ -105,95 +104,42 @@ class RgbaToRgbWithWhiteBackground(v2.Transform):
     Images without alpha channel are returned as-is (first 3 channels only). Both
     single images shaped ``(C, H, W)`` and batched tensors shaped ``(B, C, H, W)``
     are supported.
+
+    Note:
+        This transform assumes input images are already scaled to [0, 1] range.
     """
 
-    def __init__(self) -> None:
-        """Initialize the RgbaToRgbWithWhiteBackground transform."""
-        super().__init__()
-
-    def transform(self, inpt: Any, params: dict[str, Any]) -> Any:  # noqa: ARG002
+    def forward(self, image: torch.Tensor) -> torch.Tensor:
         """Apply alpha blending with white background.
 
         Args:
-            inpt: Input RGBA image tensor of shape (4, H, W)
-            params: Transform parameters (unused)
+            image: Input RGBA image tensor of shape (4, H, W) or (B, 4, H, W),
+                   assumed to be in [0, 1] range.
 
         Returns:
-            RGB image tensor of shape (3, H, W) with white background blended.
+            RGB image tensor with white background blended.
         """
-        # Convert to tensor if needed
-        img_tensor = TF.to_image(inpt) if not isinstance(inpt, torch.Tensor) else inpt
+        was_batched = image.ndim == 4
+        if not was_batched:
+            image = image.unsqueeze(0)
 
-        if img_tensor.ndim == 3:
-            return self._convert_single_image(img_tensor)
-
-        if img_tensor.ndim == 4:
-            return self._convert_batched_images(img_tensor)
-
-        msg = (
-            "RgbaToRgbWithWhiteBackground expects an image tensor with shape (C, H, W) "
-            "or a batched tensor with shape (B, C, H, W)."
-        )
-        raise ValueError(msg)
-
-    @staticmethod
-    def _convert_single_image(image: torch.Tensor) -> torch.Tensor:
-        """Convert a single image tensor from RGBA to RGB if needed."""
-        if image.shape[0] != 4:
-            # If no alpha channel, just return RGB
-            return image[:3, :, :]
-
-        # Split RGB and alpha channels
-        rgb = image[:3, :, :]  # (3, H, W)
-        alpha = image[3:4, :, :]  # (1, H, W)
-
-        # Normalize alpha to [0, 1]
-        alpha_norm = TF.to_dtype(alpha, torch.float32, scale=True)
-
-        # Create white background
-        max_val = 1.0 if rgb.is_floating_point() else 255
-        white_background = torch.full_like(rgb, fill_value=max_val)
-
-        # Convert to float for blending (TF.to_dtype handles no-op when already float).
-        rgb_float = TF.to_dtype(rgb, torch.float32, scale=True)
-        background_float = TF.to_dtype(white_background, torch.float32, scale=True)
-
-        # Alpha blending: result = foreground * alpha + background * (1 - alpha).
-        result = rgb_float * alpha_norm + background_float * (1.0 - alpha_norm)
-
-        # Convert back to the original dtype if needed.
-        return TF.to_dtype(result, image.dtype, scale=True)
-
-    @staticmethod
-    def _convert_batched_images(images: torch.Tensor) -> torch.Tensor:
-        """Convert a batch of image tensors from RGBA to RGB if needed."""
-        if images.shape[1] != 4:
-            # If no alpha channel, just return RGB
-            return images[:, :3, :, :]
-
-        # Split RGB and alpha channels
-        rgb = images[:, :3, :, :]  # (B, 3, H, W)
-        alpha = images[:, 3:4, :, :]  # (B, 1, H, W)
-
-        # Normalize alpha to [0, 1]
-        alpha_norm = TF.to_dtype(alpha, torch.float32, scale=True)
-
-        # Create white background
-        max_val = 1.0 if rgb.is_floating_point() else 255
-        white_background = torch.full_like(rgb, fill_value=max_val)
-
-        # Convert to float for blending (TF.to_dtype handles no-op when already float).
-        rgb_float = TF.to_dtype(rgb, torch.float32, scale=True)
-        background_float = TF.to_dtype(white_background, torch.float32, scale=True)
-
-        # Alpha blending: result = foreground * alpha + background * (1 - alpha).
-        result = rgb_float * alpha_norm + background_float * (1.0 - alpha_norm)
-
-        # Convert back to the original dtype if needed.
-        return TF.to_dtype(result, images.dtype, scale=True)
+        C = image.shape[1]
+        if C < 3:
+            msg = "expected at least 3 channels"
+            raise ValueError(msg)
+        if C == 3:
+            out = image[:, :3, :, :]
+        elif C == 4:
+            rgb = image[:, :3, :, :]
+            alpha = image[:, 3:4, :, :]
+            out = rgb * alpha + (1.0 - alpha)
+        else:
+            msg = "expected 3 or 4 channels"
+            raise ValueError(msg)
+        return out if was_batched else out.squeeze(0)
 
 
-class AreaResize(v2.Transform):
+class AreaResize(torch.nn.Module):
     """Resize transform using area interpolation (adaptive average pooling).
 
     This transform is equivalent to TensorFlow's tf.image.resize with method='area'.
@@ -218,33 +164,20 @@ class AreaResize(v2.Transform):
         else:
             self.size = tuple(size)
 
-    def transform(self, inpt: Any, params: dict[str, Any]) -> Any:  # noqa: ARG002
+    def forward(self, image: torch.Tensor) -> torch.Tensor:
         """Apply area interpolation resize to the input.
 
         Args:
-            inpt: Input image (Tensor, PIL Image, or other compatible format)
-            params: Transform parameters (unused)
+            image: Input image tensor of shape (C, H, W) or (B, C, H, W).
 
         Returns:
             Resized image as Tensor.
         """
-        if not isinstance(inpt, torch.Tensor):
-            inpt = TF.to_image(inpt)
-
-        dtype = inpt.dtype
-        inpt = TF.to_dtype(inpt, torch.float32)
-
-        needs_unsqueeze = inpt.ndim == 3
-        if needs_unsqueeze:
-            inpt = inpt.unsqueeze(0)
-
-        # Apply area interpolation
-        inpt = F.interpolate(inpt, size=self.size, mode="area")
-
-        if needs_unsqueeze:
-            inpt = inpt.squeeze(0)
-
-        return TF.to_dtype(inpt, dtype)
+        was_batched = image.ndim == 4
+        if not was_batched:
+            image = image.unsqueeze(0)
+        image = F.interpolate(image, size=self.size, mode="area")
+        return image if was_batched else image.squeeze(0)
 
 
 def _load_image_processor_stats(
@@ -355,8 +288,9 @@ def create_train_transform(
 
     transform_steps = [
         v2.ToImage(),
+        v2.ToDtype(torch.float32, scale=True),  # Scale to [0, 1] for alpha blending
         RgbaToRgbWithWhiteBackground(),  # Convert RGBA to RGB with white background
-        PadToSquare([255, 255, 255]),  # Pad to square with white background
+        PadToSquare([1.0, 1.0, 1.0]),  # Pad to square with white background
         v2.RandomHorizontalFlip(p=0.5),
         v2.RandomResizedCrop(
             size=image_size,
@@ -376,7 +310,7 @@ def create_train_transform(
             v2.RandomRotation(
                 degrees=(-rotation_degrees, rotation_degrees),
                 interpolation=TorchvisionInterpolationMode.BILINEAR,
-                fill=255,  # White fill for boundary
+                fill=1.0,  # White fill for boundary
             ),
         )
 
@@ -386,14 +320,13 @@ def create_train_transform(
             p=0.5,
             scale=cutout_scale,
             ratio=cutout_ratio,
-            value=127,  # Gray fill matching TensorFlow implementation
+            value=0.5,  # Gray fill matching TensorFlow implementation
         ),
     )
 
     # Convert to float and normalize
     transform_steps.extend(
         [
-            v2.ToDtype(torch.float32, scale=True),  # [0, 255] -> [0, 1]
             v2.Normalize(
                 mean=mean,
                 std=std,
@@ -424,10 +357,10 @@ def create_eval_transform(
     return v2.Compose(
         [
             v2.ToImage(),
+            v2.ToDtype(torch.float32, scale=True),  # Scale to [0, 1] for alpha blending
             RgbaToRgbWithWhiteBackground(),  # Convert RGBA to RGB with white background
-            PadToSquare([255, 255, 255]),  # Pad to square with white background
+            PadToSquare([1.0, 1.0, 1.0]),  # Pad to square with white background
             AreaResize(size=image_size),  # Use area interpolation for evaluation
-            v2.ToDtype(torch.float32, scale=True),
             v2.Normalize(mean=mean, std=std),
             ToBGR(),  # Convert RGB to BGR
         ],

@@ -432,7 +432,7 @@ def encode_multi_labels(
         if tag is None:
             return
         if tag in label_mapping:
-            labels[label_mapping[tag]] = 1
+            labels[label_mapping[tag]] = 1.0
 
     if "general" in categories:
         for tag in tags_dict.get("general", []):
@@ -500,7 +500,7 @@ def create_transform_function(
         examples["labels"] = torch.stack(labels)
 
         # Remove unnecessary fields to save memory
-        for key in ["image", "md5", "source", "score"]:
+        for key in ["image", "md5", "source", "score", "rating", "tags"]:
             examples.pop(key, None)
 
         return examples

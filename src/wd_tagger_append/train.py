@@ -423,7 +423,7 @@ def main(
     ] = 0.05,
     mixup_alpha: Annotated[
         float,
-        typer.Option("--mixup-alpha", min=0.0),
+        typer.Option("--mixup-alpha", min=0.0, max=1.0),
     ] = 0.0,
     precision: Annotated[
         str | None,
@@ -431,7 +431,7 @@ def main(
             "--precision",
             help="Numerical precision: fp32, bf16, or fp16.",
         ),
-    ] = "bf16",
+    ] = "fp32",
     gradient_checkpointing: Annotated[
         bool,
         typer.Option("--gradient-checkpointing/--no-gradient-checkpointing"),
