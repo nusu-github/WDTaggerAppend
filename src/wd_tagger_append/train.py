@@ -45,7 +45,7 @@ from .augmentation import (
 )
 from .dataset_utils import (
     categorize_label_list,
-    create_label_mapping,
+    count_tag_frequencies,
     create_transform_function,
     determine_tag_categories,
     filter_tags_pandas,
@@ -53,7 +53,7 @@ from .dataset_utils import (
     save_label_mapping_as_json,
     save_labels_as_csv,
 )
-from .inference_utils import MODEL_REPO_MAP, load_labels_hf
+from .inference_utils import MODEL_REPO_MAP, LabelData, load_labels_hf
 from .loss import AsymmetricLossMultiLabel
 from .metrics import DEFAULT_THRESHOLD, create_compute_metrics_fn
 
@@ -68,13 +68,378 @@ class DatasetSplits:
     eval: Dataset | None
 
 
+@dataclass(frozen=True)
+class DatasetOptions:
+    path: Path | None
+    name: str | None
+    config: str | None
+    token: str | None
+    train_split: str
+    eval_split: str | None
+
+
+@dataclass(frozen=True)
+class LabelSelection:
+    include_rating: bool
+    include_general: bool
+    include_character: bool
+    min_count: int
+    allowed_tags_file: Path | None
+
+    def selected_categories(self) -> tuple[str, ...]:
+        categories: list[str] = []
+        if self.include_rating:
+            categories.append("rating")
+        if self.include_general:
+            categories.append("general")
+        if self.include_character:
+            categories.append("character")
+        return tuple(categories)
+
+
+@dataclass(frozen=True)
+class LabelArtifacts:
+    label_list: list[str]
+    label2id: dict[str, int]
+    id2label: dict[int, str]
+    csv_path: Path
+    mapping_path: Path
+    category_mapping: dict[str, list[str]]
+    dataset_tag_categories: dict[str, str]
+    base_labels: list[str]
+    categories: tuple[str, ...]
+    new_tag_count: int
+
+
+class DatasetManager:
+    """Handle dataset loading and split selection."""
+
+    def __init__(self, options: DatasetOptions) -> None:
+        self._options = options
+
+    def load(self) -> Dataset | DatasetDict:
+        return _load_dataset_from_source(
+            self._options.path,
+            self._options.name,
+            self._options.config,
+            self._options.token,
+        )
+
+    def create_splits(self, dataset: Dataset | DatasetDict) -> DatasetSplits:
+        eval_split = self._options.eval_split or None
+        return _select_dataset_splits(dataset, self._options.train_split, eval_split)
+
+    @staticmethod
+    def combine(splits: DatasetSplits) -> Dataset:
+        if splits.eval is None:
+            return splits.train
+        datasets = [splits.train, splits.eval]
+        return concatenate_datasets(datasets)
+
+
+class LabelSpaceBuilder:
+    """Create merged label spaces and persist mapping artifacts."""
+
+    def __init__(
+        self,
+        selection: LabelSelection,
+        output_dir: Path,
+        report: Callable[[str], None],
+    ) -> None:
+        self._selection = selection
+        self._output_dir = output_dir
+        self._report = report
+
+    def build(self, base_label_data: LabelData, combined_dataset: Dataset) -> LabelArtifacts:
+        all_categories = ("rating", "general", "character")
+
+        base_labels = list(base_label_data.names)
+        base_label_set = set(base_labels)
+
+        tag_frequencies = count_tag_frequencies(combined_dataset, categories=all_categories)
+        new_tags_frequencies = {
+            tag: count for tag, count in tag_frequencies.items() if tag not in base_label_set
+        }
+
+        base_count = len(tag_frequencies) - len(new_tags_frequencies)
+        self._report(
+            "Dataset contains "
+            f"{len(tag_frequencies)} unique tags: {base_count} base model tags, "
+            f"{len(new_tags_frequencies)} new tags",
+        )
+
+        dataset_tag_categories = determine_tag_categories(
+            combined_dataset,
+            categories=all_categories,
+        )
+
+        selected_categories = self._selection.selected_categories()
+        allow_list: set[str] | None = None
+        if self._selection.allowed_tags_file is not None:
+            allow_list = load_allowed_tags(self._selection.allowed_tags_file)
+            if not allow_list:
+                msg = (
+                    f"No tags found in {self._selection.allowed_tags_file}. "
+                    "Provide a file containing at least one tag."
+                )
+                _raise_bad_parameter(msg)
+
+        filtered_new_tags = filter_tags_pandas(
+            tag_frequencies=new_tags_frequencies,
+            base_label_set=base_label_set,
+            tag_categories=dataset_tag_categories,
+            selected_categories=selected_categories,
+            min_count=self._selection.min_count,
+            allowed_tags=allow_list,
+        )
+
+        self._report(
+            "After filtering (category, min-count, allow-list): "
+            f"{len(filtered_new_tags)} new tags remain",
+        )
+
+        label_list = _merge_label_lists(base_labels, filtered_new_tags.keys())
+        label2id = {label: idx for idx, label in enumerate(label_list)}
+        id2label = {idx: label for label, idx in label2id.items()}
+
+        self._report(
+            f"Final training labels: {len(base_labels)} base tags + "
+            f"{len(filtered_new_tags)} new tags = {len(label_list)} total",
+        )
+
+        base_label_indices = {
+            "rating": {base_labels[idx] for idx in base_label_data.rating},
+            "character": {base_labels[idx] for idx in base_label_data.character},
+            "general": {base_labels[idx] for idx in base_label_data.general},
+        }
+
+        tag_categories = categorize_label_list(
+            label_list=label_list,
+            base_label_indices=base_label_indices,
+            dataset_tag_categories=dataset_tag_categories,
+        )
+
+        self._output_dir.mkdir(parents=True, exist_ok=True)
+        csv_path = self._output_dir / "selected_tags.csv"
+        mapping_path = self._output_dir / "label_mapping.json"
+
+        save_labels_as_csv(label_list, tag_categories, csv_path)
+        self._report(f"Saved labels as CSV to {csv_path}")
+
+        save_label_mapping_as_json(label2id, mapping_path)
+        self._report(f"Saved label mapping to {mapping_path}")
+
+        return LabelArtifacts(
+            label_list=label_list,
+            label2id=label2id,
+            id2label=id2label,
+            csv_path=csv_path,
+            mapping_path=mapping_path,
+            category_mapping=tag_categories,
+            dataset_tag_categories=dataset_tag_categories,
+            base_labels=base_labels,
+            categories=all_categories,
+            new_tag_count=len(filtered_new_tags),
+        )
+
+
+class TransformPlanner:
+    """Create dataset transforms backed by the WD image processor."""
+
+    def __init__(
+        self,
+        image_processor: WDTaggerImageProcessor,
+        label2id: dict[str, int],
+        categories: Sequence[str],
+    ) -> None:
+        self._image_processor = image_processor
+        self._label2id = label2id
+        self._categories = tuple(categories)
+
+    def _process(self, image: Any, train: bool) -> torch.Tensor:
+        features = self._image_processor(
+            images=image,
+            return_tensors="pt",
+            do_train_augmentations=train,
+        )
+        pixel_values = cast("torch.Tensor", features["pixel_values"])
+        return pixel_values.squeeze(0) if pixel_values.ndim == 4 else pixel_values
+
+    def train_transform(self) -> Callable[[dict[str, Any]], dict[str, Any]]:
+        return create_transform_function(
+            lambda image: self._process(image, True),
+            self._label2id,
+            self._categories,
+        )
+
+    def eval_transform(self) -> Callable[[dict[str, Any]], dict[str, Any]]:
+        return create_transform_function(
+            lambda image: self._process(image, False),
+            self._label2id,
+            self._categories,
+        )
+
+
+@dataclass(frozen=True)
+class ModelPreparationResult:
+    model: PeftModel
+    bf16: bool
+    fp16: bool
+    precision_dtype: torch.dtype | None
+
+
+class ModelPreparer:
+    """Load base models, expand classifier heads, and attach LoRA adapters."""
+
+    def __init__(
+        self,
+        *,
+        model_key: str,
+        quantization: Literal["none", "8bit", "4bit"],
+        gradient_checkpointing: bool,
+        lora_rank: int,
+        lora_alpha: int,
+        lora_dropout: float,
+        freeze_base_labels: bool,
+        report: Callable[[str], None],
+    ) -> None:
+        self._model_key = model_key
+        self._quantization = quantization
+        self._gradient_checkpointing = gradient_checkpointing
+        self._lora_rank = lora_rank
+        self._lora_alpha = lora_alpha
+        self._lora_dropout = lora_dropout
+        self._freeze_base_labels = freeze_base_labels
+        self._report = report
+
+    def prepare(
+        self,
+        *,
+        repo_id: str,
+        base_revision: str | None,
+        label_artifacts: LabelArtifacts,
+        precision: str | None,
+    ) -> ModelPreparationResult:
+        bf16, fp16, precision_dtype = _parse_precision(precision)
+
+        quantization_config = None
+        if self._quantization in {"8bit", "4bit"}:
+            quantization_config = _create_quantization_config(
+                in_4bit=(self._quantization == "4bit"),
+                compute_dtype=precision_dtype,
+                skip_modules=CLASSIFIER_SKIP_MODULES,
+            )
+            self._report(f"{self._quantization} quantization enabled.")
+
+        self._report(f"Loading pretrained model: {repo_id}")
+        pretrained_kwargs: dict[str, Any] = {
+            "dtype": precision_dtype,
+            "quantization_config": quantization_config,
+            "problem_type": "multi_label_classification",
+        }
+        if base_revision is not None:
+            pretrained_kwargs["revision"] = base_revision
+
+        model = TimmWrapperForImageClassification.from_pretrained(
+            repo_id,
+            **pretrained_kwargs,
+        )
+
+        _expand_classification_head(
+            model=model,
+            base_labels=label_artifacts.base_labels,
+            target_labels=label_artifacts.label_list,
+            dtype=precision_dtype,
+        )
+        model.config.label2id = label_artifacts.label2id
+        model.config.id2label = label_artifacts.id2label
+        model.config.num_labels = len(label_artifacts.label_list)
+
+        if bf16 or fp16:
+            cast_mixed_precision_params(model, dtype=precision_dtype)
+        elif quantization_config is not None:
+            model_key_lower = self._model_key.lower()
+
+            def get_input_embeddings(model_self: TimmWrapperForImageClassification) -> nn.Module:
+                if model_key_lower in {"eva02-large", "vit-large", "vit", "swinv2"}:
+                    patch_embed = cast("Any", model_self.timm_model.patch_embed)
+                    return cast("nn.Module", patch_embed.proj)
+                if model_key_lower == "convnext":
+                    stem = cast("nn.Sequential", model_self.timm_model.stem)
+                    return cast("nn.Module", stem[0])
+
+                msg = f"get_input_embeddings not implemented for model '{model_key_lower}'"
+                raise NotImplementedError(msg)
+
+            def set_input_embeddings(
+                model_self: TimmWrapperForImageClassification,
+                new_module: nn.Module,
+            ) -> None:
+                if model_key_lower in {"eva02-large", "vit-large", "vit", "swinv2"}:
+                    patch_embed = cast("Any", model_self.timm_model.patch_embed)
+                    patch_embed.proj = new_module
+                elif model_key_lower == "convnext":
+                    stem = cast("nn.Sequential", model_self.timm_model.stem)
+                    stem[0] = new_module
+                else:
+                    msg = f"set_input_embeddings not implemented for model '{model_key_lower}'"
+                    raise NotImplementedError(msg)
+
+            model.get_input_embeddings = MethodType(get_input_embeddings, model)
+            model.set_input_embeddings = MethodType(set_input_embeddings, model)
+
+            model = prepare_model_for_kbit_training(
+                model,
+                use_gradient_checkpointing=self._gradient_checkpointing,
+            )
+
+        classifier_module_name = _resolve_classifier_module(model)[1]
+        modules_to_save = {classifier_module_name}
+        target_modules = _resolve_lora_target_modules(self._model_key.lower())
+
+        lora_config = LoraConfig(
+            r=self._lora_rank,
+            lora_alpha=self._lora_alpha,
+            lora_dropout=self._lora_dropout,
+            target_modules=target_modules,
+            modules_to_save=sorted(modules_to_save),
+            bias="none",
+        )
+        model = cast("PeftModel", get_peft_model(model, lora_config))
+        model.print_trainable_parameters()
+
+        if self._freeze_base_labels:
+            num_base_labels = len(label_artifacts.base_labels)
+            num_new_labels = len(label_artifacts.label_list) - num_base_labels
+            self._report(
+                f"Freezing {num_base_labels} base labels; training only {num_new_labels} new labels",
+            )
+
+            classifier, _ = _resolve_peft_module(model)
+
+            weight_hook = _create_gradient_mask_hook(num_base_labels)
+            classifier.weight.register_hook(weight_hook)
+
+            if classifier.bias is not None:
+                bias_hook = _create_gradient_mask_hook(num_base_labels)
+                classifier.bias.register_hook(bias_hook)
+
+            self._report("Gradient masking hooks registered for base model labels")
+
+        return ModelPreparationResult(
+            model=model,
+            bf16=bf16,
+            fp16=fp16,
+            precision_dtype=precision_dtype,
+        )
+
+
 CLASSIFIER_SKIP_MODULES: tuple[str, ...] = (
     "head",
     "head.fc",
     "timm_model.head",
     "timm_model.head.fc",
 )
-
 
 _LORA_TARGET_MODULES: dict[str, tuple[str, ...]] = {
     "eva02-large": ("q_proj", "k_proj", "v_proj", "proj", "fc1_g", "fc1_x", "fc2"),
@@ -792,261 +1157,85 @@ def main(
         )
         raise typer.Exit(code=1)
 
-    raw_dataset = _load_dataset_from_source(dataset_path, dataset_name, dataset_config, hub_token)
-    eval_key = eval_split or None
-    splits = _select_dataset_splits(raw_dataset, train_split=train_split, eval_split=eval_key)
+    dataset_options = DatasetOptions(
+        path=dataset_path,
+        name=dataset_name,
+        config=dataset_config,
+        token=hub_token,
+        train_split=train_split,
+        eval_split=eval_split or None,
+    )
+    dataset_manager = DatasetManager(dataset_options)
+    raw_dataset = dataset_manager.load()
+    splits = dataset_manager.create_splits(raw_dataset)
 
     typer.echo(f"Training examples: {len(splits.train)}")
     if splits.eval is not None:
         typer.echo(f"Evaluation examples: {len(splits.eval)}")
 
-    datasets_for_labels: list[Dataset] = [splits.train]
-    if splits.eval is not None:
-        datasets_for_labels.append(splits.eval)
-        combined = concatenate_datasets(datasets_for_labels)
-    else:
-        combined = splits.train
+    combined = DatasetManager.combine(splits)
 
-    # Load base model labels first
     base_label_data = load_labels_hf(repo_id=repo_id, revision=base_revision, token=hub_token)
-    base_labels = base_label_data.names
-    base_label_set = set(base_labels)
 
-    # Extract ALL tags from dataset (no category filtering yet)
-    all_categories = ("rating", "general", "character")
-    _dataset_label_mapping_all, tag_frequencies_all = create_label_mapping(
-        combined,
-        categories=all_categories,
-        min_count=1,  # No filtering yet
-        allowed_tags=None,
-    )
-
-    # Separate base tags from new tags
-    new_tags_frequencies = {
-        tag: count for tag, count in tag_frequencies_all.items() if tag not in base_label_set
-    }
-
-    typer.echo(
-        f"Dataset contains {len(tag_frequencies_all)} unique tags: "
-        f"{len(tag_frequencies_all) - len(new_tags_frequencies)} base model tags, "
-        f"{len(new_tags_frequencies)} new tags",
-    )
-
-    # Apply filters ONLY to new tags
-    category_flags = {
-        "rating": rating,
-        "general": general,
-        "character": character,
-    }
-    selected_categories = [name for name in all_categories if category_flags[name]]
-
-    # Determine categories for new tags only
-    dataset_tag_categories = determine_tag_categories(combined, categories=all_categories)
-
-    # Load allow list if provided
-    allow_list: set[str] | None = None
-    if allowed_tags_file is not None:
-        allow_list = load_allowed_tags(allowed_tags_file)
-        if not allow_list:
-            msg = (
-                f"No tags found in {allowed_tags_file}. Provide a file containing at least one tag."
-            )
-            _raise_bad_parameter(msg)
-
-    # Filter new tags using Pandas-optimized function
-    # This replaces multiple dict comprehensions with a single vectorized operation
-    filtered_new_tags = filter_tags_pandas(
-        tag_frequencies=new_tags_frequencies,
-        base_label_set=base_label_set,
-        tag_categories=dataset_tag_categories,
-        selected_categories=selected_categories,
+    label_selection = LabelSelection(
+        include_rating=rating,
+        include_general=general,
+        include_character=character,
         min_count=min_tag_count,
-        allowed_tags=allow_list,
+        allowed_tags_file=allowed_tags_file,
     )
+    label_builder = LabelSpaceBuilder(label_selection, output_dir, typer.echo)
+    label_artifacts = label_builder.build(base_label_data, combined)
 
     typer.echo(
-        f"After filtering (category, min-count, allow-list): "
-        f"{len(filtered_new_tags)} new tags remain",
+        f"Base labels: {len(label_artifacts.base_labels)} | "
+        f"Dataset labels: {len(label_artifacts.label_list)}",
     )
-
-    # Combine base labels with filtered new tags
-    dataset_label_mapping = {**{tag: idx for idx, tag in enumerate(base_labels)}}
-    dataset_label_mapping.update(dict.fromkeys(filtered_new_tags.keys(), 0))
-
-    typer.echo(
-        f"Final training labels: {len(base_labels)} base tags + "
-        f"{len(filtered_new_tags)} new tags = {len(dataset_label_mapping)} total",
-    )
-
-    label_list = _merge_label_lists(base_labels, filtered_new_tags.keys())
-    label2id = {label: idx for idx, label in enumerate(label_list)}
-    id2label = {idx: label for label, idx in label2id.items()}
-
-    typer.echo(f"Base labels: {len(base_labels)} | Dataset labels: {len(dataset_label_mapping)}")
-    typer.echo(f"Final label space: {len(label_list)} tags")
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Save labels as CSV (WD Tagger v3 compatible format)
-    csv_path = output_dir / "selected_tags.csv"
-
-    # Build category mapping for base labels
-    base_label_indices = {
-        "rating": {base_labels[idx] for idx in base_label_data.rating},
-        "character": {base_labels[idx] for idx in base_label_data.character},
-        "general": {base_labels[idx] for idx in base_label_data.general},
-    }
-
-    # Categorize all labels using vectorized Pandas operation
-    tag_categories = categorize_label_list(
-        label_list=label_list,
-        base_label_indices=base_label_indices,
-        dataset_tag_categories=dataset_tag_categories,
-    )
-
-    save_labels_as_csv(label_list, tag_categories, csv_path)
-    typer.echo(f"Saved labels as CSV to {csv_path}")
-
-    label_mapping_path = output_dir / "label_mapping.json"
-    save_label_mapping_as_json(label2id, label_mapping_path)
-    typer.echo(f"Saved label mapping to {label_mapping_path}")
+    typer.echo(f"Final label space: {len(label_artifacts.label_list)} tags")
 
     typer.echo("Initializing image processor pipelines...")
     image_processor = WDTaggerImageProcessor(pretrained_model_name_or_path=repo_id)
 
-    def _processor_transform(image: Any, train: bool) -> torch.Tensor:
-        features = image_processor(
-            images=image,
-            return_tensors="pt",
-            do_train_augmentations=train,
-        )
-        pixel_values: torch.Tensor = features["pixel_values"]
-        return pixel_values.squeeze(0) if pixel_values.ndim == 4 else pixel_values
-
-    def _train_image_transform(image: Any) -> torch.Tensor:
-        return _processor_transform(image, train=True)
-
-    def _eval_image_transform(image: Any) -> torch.Tensor:
-        return _processor_transform(image, train=False)
-
-    train_dataset = splits.train.with_transform(
-        create_transform_function(_train_image_transform, label2id, all_categories),
+    transform_planner = TransformPlanner(
+        image_processor=image_processor,
+        label2id=label_artifacts.label2id,
+        categories=label_artifacts.categories,
     )
+    train_transform = transform_planner.train_transform()
+    eval_transform = transform_planner.eval_transform()
+
+    train_dataset = splits.train.with_transform(train_transform)
     eval_dataset = None
     if splits.eval is not None:
-        eval_dataset = splits.eval.with_transform(
-            create_transform_function(_eval_image_transform, label2id, all_categories),
-        )
+        eval_dataset = splits.eval.with_transform(eval_transform)
 
-    bf16, fp16, precision_dtype = _parse_precision(precision)
-    quantization_config = None
-    if quantization in {"8bit", "4bit"}:
-        quantization_config = _create_quantization_config(
-            in_4bit=(quantization == "4bit"),
-            compute_dtype=precision_dtype,
-            skip_modules=CLASSIFIER_SKIP_MODULES,
-        )
-        typer.echo(f"{quantization} quantization enabled.")
-
-    typer.echo(f"Loading pretrained model: {repo_id}")
-    pretrained_kwargs: dict[str, Any] = {
-        "dtype": precision_dtype,
-        "quantization_config": quantization_config,
-        "problem_type": "multi_label_classification",
-    }
-    if base_revision is not None:
-        pretrained_kwargs["revision"] = base_revision
-    model = TimmWrapperForImageClassification.from_pretrained(
-        repo_id,
-        **pretrained_kwargs,
-    )
-
-    _expand_classification_head(
-        model=model,
-        base_labels=base_labels,
-        target_labels=label_list,
-        dtype=precision_dtype,
-    )
-    model.config.label2id = label2id
-    model.config.id2label = id2label
-    model.config.num_labels = len(label_list)
-
-    if bf16 or fp16:
-        cast_mixed_precision_params(model, dtype=precision_dtype)
-    elif quantization_config:
-
-        def get_input_embeddings(self) -> nn.Module:
-            base_model = model_key.lower()
-            if base_model in {"eva02-large", "vit-large", "vit", "swinv2"}:
-                return self.timm_model.patch_embed.proj
-            if base_model == "convnext":
-                return self.timm_model.stem[0]
-
-            msg = f"get_input_embeddings not implemented for model '{base_model}'"
-            raise NotImplementedError(
-                msg,
-            )
-
-        def set_input_embeddings(self, new_module: nn.Module) -> None:
-            base_model = model_key.lower()
-            if base_model in {"eva02-large", "vit-large", "vit", "swinv2"}:
-                self.timm_model.patch_embed.proj = new_module
-            elif base_model == "convnext":
-                self.timm_model.stem[0] = new_module
-            else:
-                msg = f"set_input_embeddings not implemented for model '{base_model}'"
-                raise NotImplementedError(
-                    msg,
-                )
-
-        model.get_input_embeddings = MethodType(get_input_embeddings, model)
-        model.set_input_embeddings = MethodType(set_input_embeddings, model)
-
-        model = prepare_model_for_kbit_training(
-            model,
-            use_gradient_checkpointing=gradient_checkpointing,
-        )
-
-    classifier_module_name = _resolve_classifier_module(model)[1]
-    modules_to_save = {classifier_module_name}
-    target_modules = _resolve_lora_target_modules(model_key.lower())
-
-    lora_config = LoraConfig(
-        r=lora_rank,
+    model_preparer = ModelPreparer(
+        model_key=model_key,
+        quantization=quantization,
+        gradient_checkpointing=gradient_checkpointing,
+        lora_rank=lora_rank,
         lora_alpha=lora_alpha,
         lora_dropout=lora_dropout,
-        target_modules=target_modules,
-        modules_to_save=sorted(modules_to_save),
-        bias="none",
+        freeze_base_labels=freeze_base_labels,
+        report=typer.echo,
     )
-    model = cast("PeftModel", get_peft_model(model, lora_config))
-    model.print_trainable_parameters()
+    model_result = model_preparer.prepare(
+        repo_id=repo_id,
+        base_revision=base_revision,
+        label_artifacts=label_artifacts,
+        precision=precision,
+    )
+    model = model_result.model
+    bf16 = model_result.bf16
+    fp16 = model_result.fp16
 
-    # Register gradient masking hooks if base labels should be frozen
-    if freeze_base_labels:
-        num_base_labels = len(base_labels)
-        num_new_labels = len(label_list) - num_base_labels
-        typer.echo(
-            f"Freezing {num_base_labels} base labels; training only {num_new_labels} new labels",
-        )
-
-        # Get the classifier head (works with both timm_model.head and timm_model.head.fc)
-        classifier, _ = _resolve_peft_module(model)
-
-        # Create and register hooks for weight and bias
-        weight_hook = _create_gradient_mask_hook(num_base_labels)
-        classifier.weight.register_hook(weight_hook)
-
-        if classifier.bias is not None:
-            bias_hook = _create_gradient_mask_hook(num_base_labels)
-            classifier.bias.register_hook(bias_hook)
-
-        typer.echo("Gradient masking hooks registered for base model labels")
-
-    data_collator = _create_data_collator(num_labels=len(label_list), mixup_alpha=mixup_alpha)
+    data_collator = _create_data_collator(
+        num_labels=len(label_artifacts.label_list),
+        mixup_alpha=mixup_alpha,
+    )
 
     compute_metrics = create_compute_metrics_fn(
-        num_labels=len(label_list),
+        num_labels=len(label_artifacts.label_list),
         threshold=metrics_threshold,
     )
 

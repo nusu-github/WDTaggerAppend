@@ -4,6 +4,7 @@ This module provides metric computation functions compatible with Hugging Face T
 """
 
 from collections.abc import Callable
+from dataclasses import dataclass
 
 import torch
 from torchmetrics.classification import AUROC, F1Score, MatthewsCorrCoef, Precision, Recall
@@ -14,120 +15,89 @@ DEFAULT_THRESHOLD = 0.4
 
 __all__ = [
     "DEFAULT_THRESHOLD",
+    "MetricFactory",
+    "MetricSettings",
     "create_compute_metrics_fn",
 ]
+
+
+@dataclass(frozen=True)
+class MetricSettings:
+    """Configuration for metric computation."""
+
+    num_labels: int
+    threshold: float = DEFAULT_THRESHOLD
+
+
+class MetricFactory:
+    """Build compute_metrics functions compatible with Hugging Face Trainer."""
+
+    def __init__(self, settings: MetricSettings) -> None:
+        self._settings = settings
+
+    def build(self) -> Callable[[EvalPrediction], dict[str, float]]:
+        """Return a callable that computes evaluation metrics."""
+        f1_metric = F1Score(
+            task="multilabel",
+            num_labels=self._settings.num_labels,
+            average="micro",
+            threshold=self._settings.threshold,
+        )
+        mcc_metric = MatthewsCorrCoef(
+            task="multilabel",
+            num_labels=self._settings.num_labels,
+            threshold=self._settings.threshold,
+        )
+        precision_metric = Precision(
+            task="multilabel",
+            num_labels=self._settings.num_labels,
+            average="micro",
+            threshold=self._settings.threshold,
+        )
+        recall_metric = Recall(
+            task="multilabel",
+            num_labels=self._settings.num_labels,
+            average="micro",
+            threshold=self._settings.threshold,
+        )
+        auroc_metric = AUROC(
+            task="multilabel",
+            num_labels=self._settings.num_labels,
+            average="weighted",
+        )
+
+        def compute_metrics(eval_pred: EvalPrediction) -> dict[str, float]:
+            logits_tensor = torch.from_numpy(eval_pred.predictions).to(torch.float32)
+            labels_float = torch.from_numpy(eval_pred.label_ids).to(torch.float32)
+            labels_int = labels_float.to(torch.int64)
+            logits_tensor = torch.sigmoid(logits_tensor)
+
+            f1_score = f1_metric(logits_tensor, labels_int)
+            mcc_score = mcc_metric(logits_tensor, labels_int)
+            precision_score = precision_metric(logits_tensor, labels_int)
+            recall_score = recall_metric(logits_tensor, labels_int)
+            auroc_value = auroc_metric(logits_tensor, labels_int)
+
+            auroc_metric.reset()
+            f1_metric.reset()
+            mcc_metric.reset()
+            precision_metric.reset()
+            recall_metric.reset()
+
+            return {
+                "auroc": float(auroc_value.item()),
+                "f1": float(f1_score.item()),
+                "mcc": float(mcc_score.item()),
+                "precision": float(precision_score.item()),
+                "recall": float(recall_score.item()),
+            }
+
+        return compute_metrics
 
 
 def create_compute_metrics_fn(
     num_labels: int,
     threshold: float = DEFAULT_THRESHOLD,
 ) -> Callable[[EvalPrediction], dict[str, float]]:
-    """Create a compute_metrics function for use with Hugging Face Trainer.
-
-    All metrics use micro-averaging to handle sparse label distributions:
-    - F1: micro-averaged (global TP/FP/FN across all samples and labels)
-    - MCC: micro-averaged (global confusion matrix)
-    - Precision: micro-averaged (global TP/FP across all samples and labels)
-    - Recall: micro-averaged (global TP/FN across all samples and labels)
-    - AUROC: weighted-averaged (weighted by label support, micro not available)
-
-    Micro-averaging is preferred for datasets with sparse label distributions
-    where many labels may not appear in the data. Macro-averaging would
-    incorrectly penalize the score by including unused labels.
-
-    Args:
-        num_labels: Total number of labels in the model
-        threshold: Probability threshold for binary classification (default: 0.4)
-
-    Returns:
-        Function that computes metrics from EvalPrediction
-
-    Example:
-        >>> compute_metrics = create_compute_metrics_fn(num_labels=9667)
-        >>> trainer = Trainer(
-        ...     model=model,
-        ...     compute_metrics=compute_metrics,
-        ...     ...
-        ... )
-    """
-    # Initialize metrics with micro-averaging for sparse label datasets
-    f1_metric = F1Score(
-        task="multilabel",
-        num_labels=num_labels,
-        average="micro",  # Micro averaging for sparse labels
-        threshold=threshold,
-    )
-    mcc_metric = MatthewsCorrCoef(
-        task="multilabel",
-        num_labels=num_labels,
-        threshold=threshold,  # Micro averaging (torchmetrics default for multilabel)
-    )
-    precision_metric = Precision(
-        task="multilabel",
-        num_labels=num_labels,
-        average="micro",  # Micro averaging for sparse labels
-        threshold=threshold,
-    )
-    recall_metric = Recall(
-        task="multilabel",
-        num_labels=num_labels,
-        average="micro",  # Micro averaging for sparse labels
-        threshold=threshold,
-    )
-    auroc_metric = AUROC(
-        task="multilabel",
-        num_labels=num_labels,
-        average="weighted",  # Weighted averaging (micro not supported for AUROC)
-    )
-
-    def compute_metrics(eval_pred: EvalPrediction) -> dict[str, float]:
-        """Compute metrics from model predictions.
-
-        Follows JAX-CV behavior:
-        1. Sigmoid is applied to logits (from_logits=True in JAX-CV)
-        2. Probabilities are compared against threshold for binary predictions
-        3. Labels are compared against threshold (for soft label support)
-        4. Metrics are computed on the binarized predictions and labels
-
-        Note: Currently labels are hard (0 or 1), so label > threshold
-        is equivalent to label == 1. This preserves compatibility if
-        soft labels are introduced in the future.
-
-        Args:
-            eval_pred: Predictions and labels from evaluation
-
-        Returns:
-            Dictionary of metric names to values
-        """
-        logits = eval_pred.predictions
-        labels = eval_pred.label_ids
-
-        # Convert to tensors
-        logits_tensor = torch.from_numpy(logits).to(torch.float32)
-        labels_float = torch.from_numpy(labels).to(torch.float32)
-        labels_int = labels_float.to(torch.int64)
-        logits_tensor = torch.sigmoid(logits_tensor)
-
-        # Compute metrics on binarized predictions and labels
-        f1_score = f1_metric(logits_tensor, labels_int)
-        mcc_score = mcc_metric(logits_tensor, labels_int)
-        precision_score = precision_metric(logits_tensor, labels_int)
-        recall_score = recall_metric(logits_tensor, labels_int)
-        auroc_value = auroc_metric(logits_tensor, labels_int)
-
-        # Reset torchmetrics state to avoid leakage across evaluation cycles
-        auroc_metric.reset()
-        f1_metric.reset()
-        mcc_metric.reset()
-        precision_metric.reset()
-        recall_metric.reset()
-
-        return {
-            "auroc": float(auroc_value.item()),
-            "f1": float(f1_score.item()),
-            "mcc": float(mcc_score.item()),
-            "precision": float(precision_score.item()),
-            "recall": float(recall_score.item()),
-        }
-
-    return compute_metrics
+    """Compatibility wrapper exposing the previous functional API."""
+    return MetricFactory(MetricSettings(num_labels=num_labels, threshold=threshold)).build()
