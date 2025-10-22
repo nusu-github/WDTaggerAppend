@@ -51,10 +51,11 @@ from .dataset_utils import (
     apply_replacements_to_counts,
     categorize_label_list,
     count_tag_frequencies,
-    create_transform_function,
     determine_tag_categories,
+    encode_multi_labels,
     filter_tags_pandas,
     load_allowed_tags,
+    load_label_mapping_from_json,
     save_label_mapping_as_json,
     save_labels_as_csv,
 )
@@ -81,6 +82,13 @@ class DatasetOptions:
     token: str | None
     train_split: str
     eval_split: str | None
+
+
+@dataclass(frozen=True)
+class PreparedDatasetMetadata:
+    """Metadata generated during dataset preparation."""
+
+    label_mapping: dict[str, int] | None
 
 
 @dataclass(frozen=True)
@@ -173,11 +181,30 @@ class LabelSpaceBuilder:
         output_dir: Path,
         report: Callable[[str], None],
         forget_base_labels: bool,
+        dataset_label_mapping: Mapping[str, int] | None = None,
     ) -> None:
         self._selection = selection
         self._output_dir = output_dir
         self._report = report
         self._forget_base_labels = forget_base_labels
+        self._dataset_label_mapping = dict(dataset_label_mapping) if dataset_label_mapping else None
+
+    def _order_tags(self, tag_counts: Mapping[str, int]) -> dict[str, int]:
+        if self._dataset_label_mapping is None:
+            return dict(tag_counts)
+
+        fallback_start = len(self._dataset_label_mapping)
+        fallback_indices = {
+            tag: fallback_start + index
+            for index, (tag, _) in enumerate(tag_counts.items())
+            if tag not in self._dataset_label_mapping
+        }
+
+        ordered_items = sorted(
+            tag_counts.items(),
+            key=lambda item: self._dataset_label_mapping.get(item[0], fallback_indices[item[0]]),
+        )
+        return dict(ordered_items)
 
     def build(self, base_label_data: LabelData, combined_dataset: Dataset) -> LabelArtifacts:
         all_categories = ("rating", "general", "character")
@@ -228,6 +255,7 @@ class LabelSpaceBuilder:
             min_count=self._selection.min_count,
             allowed_tags=allowed_lookup,
         )
+        filtered_new_tags = self._order_tags(filtered_new_tags)
 
         self._report(
             "After filtering (category, min-count, allow-list): "
@@ -240,6 +268,7 @@ class LabelSpaceBuilder:
             dataset_tag_categories,
             replacement_map,
         )
+        filtered_new_tags = self._order_tags(filtered_new_tags)
 
         label_list = _merge_label_lists(base_labels, filtered_new_tags.keys())
         label2id = {label: idx for idx, label in enumerate(label_list)}
@@ -298,10 +327,18 @@ class TransformPlanner:
         image_processor: WDTaggerImageProcessor,
         label2id: dict[str, int],
         categories: Sequence[str],
+        *,
+        dataset_index_mapping: Sequence[int] | None = None,
+        precomputed_column: str | None = None,
     ) -> None:
         self._image_processor = image_processor
         self._label2id = label2id
         self._categories = tuple(categories)
+        self._num_labels = len(label2id)
+        self._dataset_index_mapping = (
+            tuple(dataset_index_mapping) if dataset_index_mapping else None
+        )
+        self._precomputed_column = precomputed_column if dataset_index_mapping else None
 
     def _process(self, image: Any, train: bool) -> torch.Tensor:
         features = self._image_processor(
@@ -312,19 +349,49 @@ class TransformPlanner:
         pixel_values = cast("torch.Tensor", features["pixel_values"])
         return pixel_values.squeeze(0) if pixel_values.ndim == 4 else pixel_values
 
+    def _build_transform(self, train: bool) -> Callable[[dict[str, Any]], dict[str, Any]]:
+        def _transform(examples: dict[str, Any]) -> dict[str, Any]:
+            images = [self._process(image, train) for image in examples["image"]]
+            examples["pixel_values"] = torch.stack(images)
+
+            if self._precomputed_column and self._precomputed_column in examples:
+                dataset_labels = examples[self._precomputed_column]
+                labels = [
+                    _map_precomputed_labels(row, self._dataset_index_mapping, self._num_labels)
+                    for row in dataset_labels
+                ]
+            else:
+                ratings = examples.get("rating")
+                batch_size = len(images)
+
+                if isinstance(ratings, list):
+                    rating_iterable: Iterable[Any | None] = ratings
+                else:
+                    rating_iterable = [ratings] * batch_size
+
+                labels = [
+                    encode_multi_labels(tags, self._label2id, self._categories, rating_value=rating)
+                    for tags, rating in zip(examples["tags"], rating_iterable, strict=False)
+                ]
+
+            examples["labels"] = torch.stack(
+                [label.to(dtype=torch.float32) for label in labels],
+            )
+
+            for key in ("image", "md5", "source", "score", "rating", "tags"):
+                examples.pop(key, None)
+            if self._precomputed_column:
+                examples.pop(self._precomputed_column, None)
+
+            return examples
+
+        return _transform
+
     def train_transform(self) -> Callable[[dict[str, Any]], dict[str, Any]]:
-        return create_transform_function(
-            lambda image: self._process(image, True),
-            self._label2id,
-            self._categories,
-        )
+        return self._build_transform(train=True)
 
     def eval_transform(self) -> Callable[[dict[str, Any]], dict[str, Any]]:
-        return create_transform_function(
-            lambda image: self._process(image, False),
-            self._label2id,
-            self._categories,
-        )
+        return self._build_transform(train=False)
 
 
 @dataclass(frozen=True)
@@ -614,6 +681,67 @@ def _select_dataset_splits(
         err=True,
     )
     return DatasetSplits(train=dataset, eval=None)
+
+
+def _load_prepared_metadata(dataset_path: Path | None) -> PreparedDatasetMetadata:
+    """Load metadata artifacts produced during dataset preparation."""
+    if dataset_path is None:
+        return PreparedDatasetMetadata(label_mapping=None)
+
+    metadata_dir = dataset_path / "metadata"
+    mapping_path = metadata_dir / "label_mapping.json"
+
+    label_mapping = None
+    if mapping_path.exists():
+        typer.echo(f"Found label mapping metadata: {mapping_path}")
+        label_mapping = load_label_mapping_from_json(mapping_path)
+
+    return PreparedDatasetMetadata(label_mapping=label_mapping)
+
+
+def _build_dataset_index_mapping(
+    dataset_label_mapping: Mapping[str, int],
+    label2id: Mapping[str, int],
+) -> list[int]:
+    """Create mapping from dataset label_matrix indices to final label indices."""
+    if not dataset_label_mapping:
+        return []
+
+    size = max(dataset_label_mapping.values()) + 1
+    mapping = [-1] * size
+
+    for tag, dataset_index in dataset_label_mapping.items():
+        if dataset_index < 0 or dataset_index >= size:
+            continue
+        final_index = label2id.get(tag)
+        mapping[dataset_index] = final_index if final_index is not None else -1
+
+    return mapping
+
+
+def _map_precomputed_labels(
+    label_matrix_row: Sequence[Any],
+    dataset_index_mapping: Sequence[int] | None,
+    num_labels: int,
+) -> torch.Tensor:
+    """Map a precomputed label matrix row to the final label space."""
+    label_tensor = torch.zeros(num_labels, dtype=torch.float32)
+
+    if not dataset_index_mapping:
+        return label_tensor
+
+    row_tensor = torch.as_tensor(label_matrix_row, dtype=torch.float32).flatten()
+    upper_bound = min(len(dataset_index_mapping), row_tensor.numel())
+
+    for dataset_index in range(upper_bound):
+        target_index = dataset_index_mapping[dataset_index]
+        if target_index is None or target_index < 0 or target_index >= num_labels:
+            continue
+        value = row_tensor[dataset_index]
+        if value != 0:
+            label_tensor[target_index] = value
+
+    return label_tensor
 
 
 def _merge_label_lists(
@@ -1239,6 +1367,7 @@ def main(
         train_split=train_split,
         eval_split=eval_split or None,
     )
+    prepared_metadata = _load_prepared_metadata(dataset_path)
     dataset_manager = DatasetManager(dataset_options)
     raw_dataset = dataset_manager.load()
     splits = dataset_manager.create_splits(raw_dataset)
@@ -1271,6 +1400,7 @@ def main(
         output_dir,
         typer.echo,
         forget_base_labels=forget_base_labels,
+        dataset_label_mapping=prepared_metadata.label_mapping,
     )
     label_artifacts = label_builder.build(base_label_data, combined)
 
@@ -1279,6 +1409,31 @@ def main(
         f"Dataset labels: {len(label_artifacts.label_list)}",
     )
     typer.echo(f"Final label space: {len(label_artifacts.label_list)} tags")
+
+    dataset_index_mapping: list[int] | None = None
+    precomputed_column: str | None = None
+    if prepared_metadata.label_mapping and "label_matrix" in splits.train.column_names:
+        candidate_mapping = _build_dataset_index_mapping(
+            prepared_metadata.label_mapping,
+            label_artifacts.label2id,
+        )
+        if candidate_mapping:
+            length_mismatch = False
+            if len(splits.train) > 0:
+                sample_row = splits.train[0].get("label_matrix")
+                if isinstance(sample_row, Sequence):
+                    length_mismatch = len(candidate_mapping) != len(sample_row)
+                else:
+                    length_mismatch = True
+            if length_mismatch:
+                typer.echo(
+                    "Warning: label_matrix column shape does not match metadata mapping; "
+                    "ignoring precomputed labels.",
+                    err=True,
+                )
+            else:
+                dataset_index_mapping = candidate_mapping
+                precomputed_column = "label_matrix"
 
     typer.echo("Initializing image processor pipelines...")
     image_processor = WDTaggerImageProcessor(
@@ -1290,6 +1445,8 @@ def main(
         image_processor=image_processor,
         label2id=label_artifacts.label2id,
         categories=label_artifacts.categories,
+        dataset_index_mapping=dataset_index_mapping,
+        precomputed_column=precomputed_column,
     )
     train_transform = transform_planner.train_transform()
     eval_transform = transform_planner.eval_transform()

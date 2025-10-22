@@ -5,7 +5,7 @@ into Hugging Face Datasets format using lightweight standard library processing.
 """
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any
@@ -15,7 +15,14 @@ from PIL import Image
 
 from datasets import ClassLabel, Dataset, DatasetDict, Features, Image as HFImage, Sequence, Value
 
-from .dataset_utils import RATING_CODE_TO_NAME
+from .dataset_utils import RATING_CODE_TO_NAME, LabelMapping
+from .stratification import (
+    build_label_matrix,
+    build_split_metadata,
+    create_shuffle_splitter,
+    dataset_from_indices,
+    generate_shuffle_split_indices,
+)
 
 app = typer.Typer(help="Prepare WD Tagger datasets from image folders")
 
@@ -28,6 +35,9 @@ class PreparationSettings:
 
     train_ratio: float
     seed: int = 42
+    stratify_by_rating: bool = False
+    min_samples_for_split: int = 2
+    multilabel_stratification: bool = True
 
 
 @dataclass(frozen=True)
@@ -37,6 +47,15 @@ class HubUploadSettings:
     enabled: bool
     repo: str | None
     private: bool
+
+
+@dataclass(frozen=True)
+class SplitResult:
+    """Encapsulate split outputs alongside persisted metadata artifacts."""
+
+    dataset_dict: DatasetDict
+    metadata: dict[str, Any] | None = None
+    label_mapping: LabelMapping | None = None
 
 
 class TagNormalizer:
@@ -148,15 +167,93 @@ class SplitPlanner:
         self._settings = settings
         self._report = report
 
-    def split(self, dataset: Dataset) -> DatasetDict:
+    def split(self, dataset: Dataset) -> SplitResult:
+        dataset_size = len(dataset)
+
+        if dataset_size < self._settings.min_samples_for_split:
+            self._report(
+                f"Warning: Dataset has only {dataset_size} sample(s). "
+                "Skipping split and using all data for training.",
+            )
+            dataset_dict = DatasetDict({"train": dataset, "validation": dataset.select([])})
+            return SplitResult(dataset_dict)
+
+        desired_test_ratio = 1.0 - self._settings.train_ratio
+        n_test = max(1, int(dataset_size * desired_test_ratio))
+        n_train = dataset_size - n_test
+
+        if n_train < 1:
+            self._report(
+                f"Warning: Train ratio {self._settings.train_ratio} would result in "
+                f"empty training set (dataset size: {dataset_size}). "
+                "Using all data for training.",
+            )
+            dataset_dict = DatasetDict({"train": dataset, "validation": dataset.select([])})
+            return SplitResult(dataset_dict)
+
         self._report(
             f"Splitting dataset (train ratio: {self._settings.train_ratio})...",
         )
 
-        split = dataset.train_test_split(
-            test_size=1.0 - self._settings.train_ratio,
-            seed=self._settings.seed,
-        )
+        effective_test_ratio = n_test / dataset_size
+        split_kwargs = {
+            "test_size": effective_test_ratio,
+            "seed": self._settings.seed,
+        }
+
+        if self._settings.multilabel_stratification:
+            self._report("Using multilabel stratified split...")
+            try:
+                label_matrix_result = build_label_matrix(dataset)
+                splitter = create_shuffle_splitter(
+                    test_size=effective_test_ratio,
+                    seed=self._settings.seed,
+                )
+                train_indices, validation_indices = generate_shuffle_split_indices(
+                    label_matrix_result.matrix,
+                    splitter,
+                )
+                dataset_with_labels = dataset.add_column(
+                    "label_matrix",
+                    label_matrix_result.matrix.tolist(),
+                )
+                dataset_dict = dataset_from_indices(
+                    dataset_with_labels,
+                    train_indices,
+                    validation_indices,
+                )
+                metadata = build_split_metadata(
+                    splitter_name=splitter.__class__.__name__,
+                    seed=self._settings.seed,
+                    params={"test_size": effective_test_ratio, "n_splits": splitter.n_splits},
+                    train_indices=train_indices,
+                    validation_indices=validation_indices,
+                    matrix_shape=label_matrix_result.matrix.shape,
+                )
+                self._report(f"Train set: {len(dataset_dict['train'])} examples")
+                self._report(f"Validation set: {len(dataset_dict['validation'])} examples")
+                return SplitResult(dataset_dict, metadata, label_matrix_result.mapping)
+            except ValueError as exc:
+                self._report(
+                    f"Warning: Multilabel stratification failed ({exc}). "
+                    "Falling back to rating or random split.",
+                )
+
+        if self._settings.stratify_by_rating:
+            self._report("Using stratified split by rating...")
+            try:
+                split = dataset.train_test_split(
+                    stratify_by_column="rating",
+                    **split_kwargs,
+                )
+            except ValueError as exc:
+                self._report(
+                    f"Warning: Stratification failed ({exc}). Falling back to random split.",
+                )
+                split = dataset.train_test_split(**split_kwargs)
+        else:
+            split = dataset.train_test_split(**split_kwargs)
+
         dataset_dict = DatasetDict(
             {
                 "train": split["train"],
@@ -167,7 +264,7 @@ class SplitPlanner:
         self._report(f"Train set: {len(dataset_dict['train'])} examples")
         self._report(f"Validation set: {len(dataset_dict['validation'])} examples")
 
-        return dataset_dict
+        return SplitResult(dataset_dict)
 
 
 class DatasetSaver:
@@ -182,6 +279,23 @@ class DatasetSaver:
         self._report(f"Saving dataset to: {output_dir}")
         dataset_dict.save_to_disk(output_dir)
         self._report("Dataset saved successfully")
+
+    def save_split_metadata(self, metadata: Mapping[str, Any], output_dir: Path) -> Path:
+        metadata_dir = output_dir / "metadata"
+        metadata_dir.mkdir(parents=True, exist_ok=True)
+        path = metadata_dir / "splits.json"
+        with path.open("w", encoding="utf-8") as handle:
+            json.dump(metadata, handle, indent=2, ensure_ascii=False)
+        self._report(f"Saved split metadata to: {path}")
+        return path
+
+    def save_label_mapping(self, label_mapping: LabelMapping, output_dir: Path) -> Path:
+        metadata_dir = output_dir / "metadata"
+        metadata_dir.mkdir(parents=True, exist_ok=True)
+        path = metadata_dir / "label_mapping.json"
+        label_mapping.save_as_json(path)
+        self._report(f"Saved label mapping to: {path}")
+        return path
 
     def push_to_hub(self, dataset_dict: DatasetDict, settings: HubUploadSettings) -> None:
         if not settings.repo:
@@ -240,6 +354,13 @@ def prepare(
             help="Ratio of data to use for training",
         ),
     ] = 0.8,
+    stratify_splits: Annotated[
+        bool,
+        typer.Option(
+            "--stratify-splits/--no-stratify-splits",
+            help="Use multilabel stratification when forming train/validation splits",
+        ),
+    ] = True,
     push_to_hub: Annotated[
         bool,
         typer.Option(
@@ -275,14 +396,22 @@ def prepare(
     records = scanner.scan(image_dir)
     dataset = factory.build(records)
 
-    preparation_settings = PreparationSettings(train_ratio=train_ratio)
+    preparation_settings = PreparationSettings(
+        train_ratio=train_ratio,
+        multilabel_stratification=stratify_splits,
+    )
     split_planner = SplitPlanner(preparation_settings, report)
-    dataset_dict = split_planner.split(dataset)
+    split_result = split_planner.split(dataset)
+    dataset_dict = split_result.dataset_dict
 
     saver = DatasetSaver(report, warn)
 
     if output_dir:
         saver.save_to_disk(dataset_dict, output_dir)
+        if split_result.metadata is not None:
+            saver.save_split_metadata(split_result.metadata, output_dir)
+        if split_result.label_mapping is not None:
+            saver.save_label_mapping(split_result.label_mapping, output_dir)
 
     hub_settings = HubUploadSettings(enabled=push_to_hub, repo=hub_repo, private=private)
     if hub_settings.enabled:
