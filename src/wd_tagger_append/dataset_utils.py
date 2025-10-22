@@ -117,19 +117,62 @@ class RatingNormalizer:
         return RATING_CODE_TO_NAME.get(candidate, candidate) if candidate else None
 
 
+@dataclass(frozen=True)
+class AllowedTagSpec:
+    """Allowed tag definitions plus optional replacement mapping."""
+
+    values: frozenset[str]
+    replacements: dict[str, str]
+
+    def __post_init__(self) -> None:
+        missing: set[str] = {tag for tag in self.replacements if tag not in self.values}
+        if missing:
+            msg = f"Replacement keys must be part of the allowed set: {sorted(missing)}"
+            raise ValueError(msg)
+
+    def is_empty(self) -> bool:
+        return not self.values
+
+    def as_collection(self) -> Collection[str]:
+        return self.values
+
+    def replacement_for(self, tag: str) -> str | None:
+        return self.replacements.get(tag)
+
+
 class AllowedTagLoader:
     """Load, sanitize, and expose allow lists for tag filtering."""
 
     @staticmethod
-    def load(path: Path) -> set[str]:
-        allowed: set[str] = set()
-        with path.open(encoding="utf-8") as handle:
-            for raw_line in handle:
-                tag = raw_line.strip()
-                if not tag or tag.startswith("#"):
+    def load(path: Path) -> AllowedTagSpec:
+        allowed: list[str] = []
+        replacements: dict[str, str] = {}
+
+        with path.open(encoding="utf-8", newline="") as handle:
+            reader = csv.reader(handle)
+            for row in reader:
+                if not row:
                     continue
-                allowed.add(tag)
-        return allowed
+
+                original = row[0].strip()
+                if not original or original.startswith("#"):
+                    continue
+
+                lower_original = original.lower()
+                second = row[1].strip() if len(row) > 1 else ""
+                if lower_original in {"original", "source", "tag"} and second.lower() in {
+                    "replacement",
+                    "target",
+                    "alias",
+                }:
+                    continue
+
+                allowed.append(original)
+                replacement = second.strip()
+                if replacement:
+                    replacements[original] = replacement
+
+        return AllowedTagSpec(frozenset(allowed), replacements)
 
 
 class TagFrequencyCounter:
@@ -476,9 +519,41 @@ class DatasetStatisticsCollector:
         }
 
 
-def load_allowed_tags(path: Path) -> set[str]:
+def load_allowed_tags(path: Path) -> AllowedTagSpec:
     """Compatibility wrapper around AllowedTagLoader."""
     return AllowedTagLoader.load(path)
+
+
+def apply_replacements_to_counts(
+    tag_counts: Mapping[str, int],
+    replacements: Mapping[str, str],
+) -> dict[str, int]:
+    """Map tag counts through replacement definitions."""
+    if not replacements:
+        return dict(tag_counts)
+
+    remapped: dict[str, int] = {}
+    for tag, count in tag_counts.items():
+        target = replacements.get(tag, tag)
+        remapped[target] = remapped.get(target, 0) + count
+    return remapped
+
+
+def add_replacement_categories(
+    categories: Mapping[str, str],
+    replacements: Mapping[str, str],
+) -> dict[str, str]:
+    """Return category assignments augmented with replacement entries."""
+    if not replacements:
+        return dict(categories)
+
+    updated = dict(categories)
+    for original, replacement in replacements.items():
+        category = categories.get(original)
+        if category is None:
+            continue
+        updated.setdefault(replacement, category)
+    return updated
 
 
 def count_tag_frequencies(
@@ -595,6 +670,7 @@ def get_dataset_statistics(
 
 __all__ = [
     "AllowedTagLoader",
+    "AllowedTagSpec",
     "DatasetStatisticsCollector",
     "LabelMapping",
     "LabelMappingBuilder",
@@ -607,6 +683,8 @@ __all__ = [
     "TagFilter",
     "TagFrequencyCounter",
     "TransformBuilder",
+    "add_replacement_categories",
+    "apply_replacements_to_counts",
     "categorize_label_list",
     "count_tag_frequencies",
     "create_label_mapping",

@@ -1,6 +1,7 @@
 """CLI for LoRA fine-tuning of WD tagger models using Hugging Face Trainer."""
 
-from collections.abc import Callable, Iterable, Sequence
+from collections import Counter
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import MethodType
@@ -44,6 +45,9 @@ from .augmentation import (
     create_mixup_collate_fn,
 )
 from .dataset_utils import (
+    AllowedTagSpec,
+    add_replacement_categories,
+    apply_replacements_to_counts,
     categorize_label_list,
     count_tag_frequencies,
     create_transform_function,
@@ -109,6 +113,29 @@ class LabelArtifacts:
     base_labels: list[str]
     categories: tuple[str, ...]
     new_tag_count: int
+    tag_frequencies: Counter[str]
+
+
+def _compute_class_weights(
+    frequencies: Mapping[str, int],
+    labels: Sequence[str],
+    *,
+    epsilon: float = 1.0,
+) -> torch.Tensor:
+    """Create a class weight tensor aligned with the provided label order."""
+    if not labels:
+        return torch.tensor([], dtype=torch.float32)
+
+    counts = torch.tensor(
+        [float(frequencies.get(label, 0)) for label in labels],
+        dtype=torch.float32,
+    )
+    total = counts.sum()
+    if total <= 0:
+        return torch.ones_like(counts)
+
+    num_classes = counts.numel()
+    return (total + epsilon) / (num_classes * (counts + epsilon))
 
 
 class DatasetManager:
@@ -182,15 +209,17 @@ class LabelSpaceBuilder:
         )
 
         selected_categories = self._selection.selected_categories()
-        allow_list: set[str] | None = None
+        allowed_spec: AllowedTagSpec | None = None
+        allowed_lookup: set[str] | None = None
         if self._selection.allowed_tags_file is not None:
-            allow_list = load_allowed_tags(self._selection.allowed_tags_file)
-            if not allow_list:
+            allowed_spec = load_allowed_tags(self._selection.allowed_tags_file)
+            if allowed_spec.is_empty():
                 msg = (
                     f"No tags found in {self._selection.allowed_tags_file}. "
                     "Provide a file containing at least one tag."
                 )
                 _raise_bad_parameter(msg)
+            allowed_lookup = set(allowed_spec.as_collection())
 
         filtered_new_tags = filter_tags_pandas(
             tag_frequencies=new_tags_frequencies,
@@ -198,12 +227,19 @@ class LabelSpaceBuilder:
             tag_categories=dataset_tag_categories,
             selected_categories=selected_categories,
             min_count=self._selection.min_count,
-            allowed_tags=allow_list,
+            allowed_tags=allowed_lookup,
         )
 
         self._report(
             "After filtering (category, min-count, allow-list): "
             f"{len(filtered_new_tags)} new tags remain",
+        )
+
+        replacement_map = allowed_spec.replacements if allowed_spec is not None else {}
+        filtered_new_tags = apply_replacements_to_counts(filtered_new_tags, replacement_map)
+        dataset_tag_categories = add_replacement_categories(
+            dataset_tag_categories,
+            replacement_map,
         )
 
         label_list = _merge_label_lists(base_labels, filtered_new_tags.keys())
@@ -251,6 +287,7 @@ class LabelSpaceBuilder:
             base_labels=base_labels,
             categories=all_categories,
             new_tag_count=len(filtered_new_tags),
+            tag_frequencies=tag_frequencies,
         )
 
 
@@ -425,9 +462,8 @@ class ModelPreparer:
             if num_base_labels == 0:
                 self._report("No base labels detected; skipping gradient masking.")
             else:
-                self._report(
-                    f"Freezing {num_base_labels} base labels; training only {num_new_labels} new labels",
-                )
+                self._report(f"Freezing {num_base_labels} base labels before LoRA fine-tuning.")
+                self._report(f"Training updates target {num_new_labels} new labels only.")
 
                 classifier, _ = _resolve_peft_module(model)
 
@@ -829,7 +865,8 @@ def main(
         typer.Option(
             "--allowed-tags-file",
             help=(
-                "Optional newline-delimited file restricting NEW tags used for training. "
+                "Optional file restricting NEW tags used for training. "
+                "Supports newline-delimited entries or CSV with an optional replacement column. "
                 "Base model tags are always retained."
             ),
             exists=True,
@@ -1273,6 +1310,15 @@ def main(
         threshold=metrics_threshold,
     )
 
+    class_weights = _compute_class_weights(
+        label_artifacts.tag_frequencies,
+        label_artifacts.label_list,
+    )
+    if class_weights.numel() > 0:
+        typer.echo("Class weights derived from dataset label frequencies.")
+
+    loss_module = AsymmetricLossMultiLabel(class_weights=class_weights)
+
     trainer_eval_strategy = "no" if eval_dataset is None else eval_strategy
     load_best = eval_dataset is not None and eval_strategy != "no"
 
@@ -1332,10 +1378,19 @@ def main(
         "eval_dataset": eval_dataset,
         "data_collator": data_collator,
         "compute_metrics": compute_metrics if eval_dataset is not None else None,
-        "compute_loss_func": AsymmetricLossMultiLabel(),
+        "compute_loss_func": loss_module,
         "processing_class": image_processor,
     }
     trainer = Trainer(**trainer_kwargs)
+
+    if class_weights.numel() > 0:
+        class_weights_path = output_dir / "class_weights.pt"
+        payload = {
+            "labels": label_artifacts.label_list,
+            "weights": class_weights.cpu(),
+        }
+        torch.save(payload, class_weights_path)
+        typer.echo(f"Saved class weights to {class_weights_path}")
 
     typer.echo("Starting training...")
     trainer.train(resume_from_checkpoint=resume_from_checkpoint)
