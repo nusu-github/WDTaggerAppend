@@ -153,7 +153,6 @@ class LabelHubFetcher:
     def download_csv(
         self,
         repo_id: str,
-        *,
         revision: str | None = None,
         token: str | None = None,
     ) -> Path:
@@ -172,7 +171,6 @@ class LabelHubFetcher:
     def fetch_catalog(
         self,
         repo_id: str,
-        *,
         revision: str | None = None,
         token: str | None = None,
     ) -> LabelCatalog:
@@ -188,7 +186,6 @@ class LabelArtifactLocator:
 
     def locate(
         self,
-        *,
         explicit_path: Path | None,
         adapter: str | None,
         adapter_revision: str | None,
@@ -223,7 +220,6 @@ class LabelCatalogLoader:
 
     def __init__(
         self,
-        *,
         hub_fetcher: LabelHubFetcher | None = None,
         warning_callback: Callable[[str], None] | None = None,
     ) -> None:
@@ -233,7 +229,6 @@ class LabelCatalogLoader:
     def load(
         self,
         base_identifier: str,
-        *,
         base_revision: str | None,
         base_token: str | None,
         labels_path: Path | None,
@@ -274,7 +269,6 @@ class LabelCatalogLoader:
     def _load_base_catalog(
         self,
         base_identifier: str,
-        *,
         revision: str | None,
         token: str | None,
         fallback_repo: str | None,
@@ -314,7 +308,6 @@ class ProbabilityFormatter:
     def format(
         self,
         probabilities: torch.Tensor,
-        *,
         general_threshold: float,
         character_threshold: float,
     ) -> tuple[str, str, dict[str, float], dict[str, float], dict[str, float]]:
@@ -347,7 +340,6 @@ class ProbabilityFormatter:
         self,
         values: np.ndarray,
         indices: tuple[int, ...],
-        *,
         threshold: float | None = None,
     ) -> dict[str, float]:
         if not indices:

@@ -247,7 +247,6 @@ class TagFilter:
     def __init__(
         self,
         categories: TagCategorySet,
-        *,
         min_count: int = 1,
         allowed_tags: Collection[str] | None = None,
     ) -> None:
@@ -368,7 +367,6 @@ class LabelMappingBuilder:
     def __init__(
         self,
         categories: TagCategorySet,
-        *,
         min_count: int = 1,
         allowed_tags: Collection[str] | None = None,
     ) -> None:
@@ -419,7 +417,6 @@ class MultiHotEncoder:
     def __call__(
         self,
         tags: Mapping[str, Any],
-        *,
         rating_value: Any | None = None,
     ) -> torch.Tensor:
         num_classes = len(self._mapping)
@@ -593,7 +590,6 @@ def filter_tags_pandas(
 def create_label_mapping(
     dataset: Dataset | Iterable[Mapping[str, Any]],
     categories: Sequence[str] | None = None,
-    *,
     min_count: int = 1,
     allowed_tags: Collection[str] | None = None,
 ) -> tuple[dict[str, int], Counter[str]]:
@@ -639,7 +635,6 @@ def encode_multi_labels(
     tags_dict: Mapping[str, Any],
     label_mapping: Mapping[str, int],
     categories: Sequence[str],
-    *,
     rating_value: Any | None = None,
 ) -> torch.Tensor:
     """Encode a tag dictionary by composing MultiHotEncoder."""

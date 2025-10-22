@@ -107,7 +107,6 @@ class LabelMetadataService:
     def load(
         self,
         base_identifier: str,
-        *,
         base_revision: str | None,
         base_token: str | None,
         labels_path: Path | None,
@@ -138,7 +137,6 @@ class ModelLoader:
     def load(
         self,
         base_identifier: str,
-        *,
         num_labels: int,
         token: str | None,
         revision: str | None,
@@ -364,7 +362,6 @@ class FileOrganizer:
     def __init__(
         self,
         extractor: TagExtractor,
-        *,
         mode: Literal["copy", "move"],
         destination_root: Path,
         category: Literal["rating", "character", "general"],
@@ -542,7 +539,6 @@ def main(
         str | None,
         typer.Option(
             "--base-repo",
-            "--repo-id",
             help=(
                 "Override the base model repo or directory (defaults to --model / MODEL_REPO_MAP)."
             ),
@@ -569,7 +565,7 @@ def main(
     forget_base_labels: Annotated[
         bool,
         typer.Option(
-            "--forget-base-labels/--keep-base-labels",
+            "--forget-base-labels",
             help="Skip base model label fallbacks and require explicit label artifacts.",
         ),
     ] = False,
@@ -607,16 +603,16 @@ def main(
             min=1,
             help="Number of images to process per forward pass when batching directories.",
         ),
-    ] = 8,
+    ] = 1,
     quantization: Annotated[
         bool,
         typer.Option(
-            "--quantization/--no-quantization",
+            "--quantization",
             help="Enable 8-bit quantization for the model.",
         ),
-    ] = True,
+    ] = False,
     precision: Annotated[
-        str | None,
+        Literal["fp32", "bf16", "fp16"] | None,
         typer.Option(
             "--precision",
             help="Precision for non-quantized weights: fp32, bf16, or fp16.",
@@ -641,7 +637,6 @@ def main(
         Literal["text", "copy", "move", "none"],
         typer.Option(
             "--directory-output-mode",
-            "--dir-output",
             help=(
                 "Output mode when the input path is a directory. "
                 "Choose from 'text', 'copy', 'move', or 'none'."
@@ -653,7 +648,6 @@ def main(
         Path | None,
         typer.Option(
             "--directory-summary-path",
-            "--dir-text-file",
             help="Destination file for directory summaries when --directory-output-mode=text.",
             file_okay=True,
             dir_okay=False,
@@ -664,7 +658,6 @@ def main(
         Literal["rating", "character", "general"],
         typer.Option(
             "--directory-category",
-            "--dir-category",
             help=(
                 "Tag category used when organizing directories with copy/move output. "
                 "Ignored for text or none."
@@ -676,7 +669,6 @@ def main(
         Path | None,
         typer.Option(
             "--directory-destination",
-            "--dir-destination",
             help=(
                 "Root directory to create tag folders in when --directory-output-mode is copy or move. "
                 "Defaults to '<input>/sorted_by_<category>'."
@@ -689,7 +681,6 @@ def main(
         bool,
         typer.Option(
             "--directory-overwrite/--no-directory-overwrite",
-            "--dir-overwrite/--no-dir-overwrite",
             help="Overwrite files that already exist in the destination when copying or moving.",
         ),
     ] = False,

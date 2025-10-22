@@ -837,6 +837,20 @@ wheels = [
 ]
 
 [[package]]
+name = "liger-kernel"
+version = "0.6.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "torch", version = "2.9.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
+    { name = "torch", version = "2.9.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "triton" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/31/23/be0b4dcac42d77f99406c906567cde22a7a3d71b3f3ffdfda2ac6153ec36/liger_kernel-0.6.2.tar.gz", hash = "sha256:5c5bcffffa769bc26ae838f5a4954170dd5cacde036abb1b383039f39fa5fd69", size = 3679495, upload-time = "2025-08-22T00:15:28.456Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/94/2c/68d992835e8630c1b94cdcb246ea7eecad790a955037ca3f19b6c01e8215/liger_kernel-0.6.2-py3-none-any.whl", hash = "sha256:303b9bbf5c10f9289c3139afb41e4d989e8c809516624a106b89b064163d971d", size = 192815, upload-time = "2025-08-22T00:15:27.04Z" },
+]
+
+[[package]]
 name = "lightning-utilities"
 version = "0.15.2"
 source = { registry = "https://pypi.org/simple" }
@@ -2801,6 +2815,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+liger-kernel = [
+    { name = "liger-kernel" },
+]
 schedulefree = [
     { name = "schedulefree" },
 ]
@@ -2820,6 +2837,7 @@ requires-dist = [
     { name = "datasets", extras = ["vision"], specifier = ">=4.2.0" },
     { name = "evaluate", specifier = ">=0.4.6" },
     { name = "huggingface-hub", extras = ["hf-xet", "hf-transfer"], specifier = ">=0.35.3" },
+    { name = "liger-kernel", marker = "extra == 'liger-kernel'", specifier = ">=0.6.2" },
     { name = "numpy", specifier = ">=2.2.6" },
     { name = "pandas", specifier = ">=2.3.3" },
     { name = "pathvalidate", specifier = ">=3.2.0" },
@@ -2836,7 +2854,7 @@ requires-dist = [
     { name = "typer", specifier = ">=0.19.2" },
     { name = "wandb", specifier = ">=0.22.2" },
 ]
-provides-extras = ["schedulefree"]
+provides-extras = ["schedulefree", "liger-kernel"]
 
 [package.metadata.requires-dev]
 dev = [

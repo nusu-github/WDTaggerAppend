@@ -26,6 +26,7 @@ from transformers import (
     Trainer,
     TrainingArguments,
 )
+from transformers.trainer_utils import HubStrategy, IntervalStrategy, SaveStrategy, SchedulerType
 from transformers.training_args import OptimizerNames
 from typer import BadParameter
 
@@ -119,7 +120,6 @@ class LabelArtifacts:
 def _compute_class_weights(
     frequencies: Mapping[str, int],
     labels: Sequence[str],
-    *,
     epsilon: float = 1.0,
 ) -> torch.Tensor:
     """Create a class weight tensor aligned with the provided label order."""
@@ -172,7 +172,6 @@ class LabelSpaceBuilder:
         selection: LabelSelection,
         output_dir: Path,
         report: Callable[[str], None],
-        *,
         forget_base_labels: bool,
     ) -> None:
         self._selection = selection
@@ -341,7 +340,6 @@ class ModelPreparer:
 
     def __init__(
         self,
-        *,
         model_key: str,
         quantization: Literal["none", "8bit", "4bit"],
         gradient_checkpointing: bool,
@@ -362,7 +360,6 @@ class ModelPreparer:
 
     def prepare(
         self,
-        *,
         repo_id: str,
         base_revision: str | None,
         label_artifacts: LabelArtifacts,
@@ -878,7 +875,7 @@ def main(
     forget_base_labels: Annotated[
         bool,
         typer.Option(
-            "--forget-base-labels/--keep-base-labels",
+            "--forget-base-labels",
             help="Exclude base model labels when building the training label space.",
         ),
     ] = False,
@@ -981,7 +978,7 @@ def main(
         ),
     ] = 0.0,
     precision: Annotated[
-        str | None,
+        Literal["fp32", "bf16", "fp16"] | None,
         typer.Option(
             "--precision",
             help="Numerical precision: fp32, bf16, or fp16.",
@@ -997,10 +994,10 @@ def main(
     gradient_checkpointing: Annotated[
         bool,
         typer.Option(
-            "--gradient-checkpointing/--no-gradient-checkpointing",
+            "--gradient-checkpointing",
             help="Enable gradient checkpointing to reduce memory usage at the cost of compute.",
         ),
-    ] = True,
+    ] = False,
     freeze_base_labels: Annotated[
         bool,
         typer.Option(
@@ -1030,23 +1027,23 @@ def main(
     ] = 50,
     logging_first_step: Annotated[
         bool,
-        typer.Option("--logging-first-step/--no-logging-first-step"),
+        typer.Option("--logging-first-step"),
     ] = False,
     logging_nan_inf_filter: Annotated[
         bool,
         typer.Option("--logging-nan-inf-filter/--no-logging-nan-inf-filter"),
     ] = True,
     logging_strategy: Annotated[
-        Literal["no", "steps", "epoch"],
+        IntervalStrategy,
         typer.Option("--logging-strategy", help="Logging strategy: 'no', 'steps', or 'epoch'."),
-    ] = "steps",
+    ] = IntervalStrategy.STEPS,
     save_strategy: Annotated[
-        Literal["no", "steps", "epoch"],
+        SaveStrategy,
         typer.Option(
             "--save-strategy",
             help="Checkpoint save strategy.",
         ),
-    ] = "epoch",
+    ] = SaveStrategy.EPOCH,
     save_total_limit: Annotated[
         int,
         typer.Option(
@@ -1056,12 +1053,12 @@ def main(
         ),
     ] = 2,
     eval_strategy: Annotated[
-        Literal["no", "steps", "epoch"],
+        IntervalStrategy,
         typer.Option(
             "--eval-strategy",
             help="Evaluation strategy for Trainer.",
         ),
-    ] = "epoch",
+    ] = IntervalStrategy.EPOCH,
     eval_accumulation_steps: Annotated[
         int | None,
         typer.Option(
@@ -1115,13 +1112,16 @@ def main(
         ),
     ] = 0,
     lr_scheduler_type: Annotated[
-        str,
-        typer.Option("--lr-scheduler-type", help="LR scheduler type (e.g. 'linear', 'cosine')."),
-    ] = "linear",
+        SchedulerType,
+        typer.Option(
+            "--lr-scheduler-type",
+            help="LR scheduler type (e.g. 'linear', 'cosine', 'constant').",
+        ),
+    ] = SchedulerType.LINEAR,
     dataloader_drop_last: Annotated[
         bool,
         typer.Option(
-            "--dataloader-drop-last/--no-dataloader-drop-last",
+            "--dataloader-drop-last",
             help="Drop last incomplete batch each epoch when True.",
         ),
     ] = False,
@@ -1136,14 +1136,14 @@ def main(
     dataloader_pin_memory: Annotated[
         bool,
         typer.Option(
-            "--dataloader-pin-memory/--no-dataloader-pin-memory",
+            "--dataloader-pin-memory",
             help="Pin memory in data loaders for faster host->device transfer.",
         ),
-    ] = True,
+    ] = False,
     dataloader_persistent_workers: Annotated[
         bool,
         typer.Option(
-            "--dataloader-persistent-workers/--no-dataloader-persistent-workers",
+            "--dataloader-persistent-workers",
             help="Keep data loader workers alive between epochs (may speed up training).",
         ),
     ] = False,
@@ -1163,7 +1163,7 @@ def main(
     torch_compile: Annotated[
         bool,
         typer.Option(
-            "--torch-compile/--no-torch-compile",
+            "--torch-compile",
             help="Compile model with torch.compile() when available.",
         ),
     ] = False,
@@ -1172,8 +1172,15 @@ def main(
         typer.Option("--seed", help="Random seed for reproducibility."),
     ] = 42,
     resume_from_checkpoint: Annotated[
-        str | None,
-        typer.Option("--resume-from-checkpoint", help="Path or Hub checkpoint to resume from."),
+        Path | None,
+        typer.Option(
+            "--resume-from-checkpoint",
+            help="Path or Hub checkpoint to resume from.",
+            exists=True,
+            file_okay=False,
+            dir_okay=True,
+            resolve_path=True,
+        ),
     ] = None,
     report_to: Annotated[
         list[str] | None,
@@ -1188,19 +1195,19 @@ def main(
         typer.Option("--hub-model-id", help="Hub repo id to push to."),
     ] = None,
     hub_strategy: Annotated[
-        Literal["end", "every_save", "checkpoint"],
+        HubStrategy,
         typer.Option(
             "--hub-strategy",
             help="When to push to the Hub: 'end', 'every_save', or 'checkpoint'.",
         ),
-    ] = "every_save",
+    ] = HubStrategy.EVERY_SAVE,
     hub_token: Annotated[
         str | None,
         typer.Option("--hub-token", help="Token for private Hub repos or datasets."),
     ] = None,
     private: Annotated[
         bool,
-        typer.Option("--private", help="Make the Hub repository private when pushing."),
+        typer.Option("--private/--public", help="Make the Hub repository private when pushing."),
     ] = True,
 ) -> None:
     """Run LoRA fine-tuning."""
@@ -1323,7 +1330,7 @@ def main(
     load_best = eval_dataset is not None and eval_strategy != "no"
 
     training_args_kwargs: dict[str, Any] = {
-        "output_dir": str(output_dir),
+        "output_dir": output_dir,
         "learning_rate": learning_rate,
         "per_device_train_batch_size": train_batch_size,
         "per_device_eval_batch_size": eval_batch_size,
@@ -1393,7 +1400,7 @@ def main(
         typer.echo(f"Saved class weights to {class_weights_path}")
 
     typer.echo("Starting training...")
-    trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+    trainer.train(resume_from_checkpoint=str(resume_from_checkpoint))
     typer.echo("Training completed. Saving artifacts...")
 
     trainer.save_model()
