@@ -293,21 +293,21 @@ def create_random_interpolation_resize(
 
 def create_train_transform(
     pretrained_model_name_or_path: str,
+    noise_level: int = 0,
     random_crop_scale: tuple[float, float] = (0.87, 0.998),
     rotation_degrees: float = 0.0,
     cutout_scale: tuple[float, float] = (0.02, 0.1),
     cutout_ratio: tuple[float, float] = (0.3, 3.3),
-    random_resize_method: bool = True,
 ) -> v2.Compose:
     """Create the training augmentation pipeline that mirrors the TensorFlow implementation.
 
     Args:
         pretrained_model_name_or_path: Name or path forwarded to Hugging Face ``AutoConfig``.
+        noise_level: Level of augmentation noise to apply (0: none, 1: mild, 2: strong).
         random_crop_scale: Scale range for ``RandomResizedCrop`` (min, max).
         rotation_degrees: Maximum rotation angle in degrees. Set to 0 to disable.
         cutout_scale: Area proportion range supplied to ``RandomErasing``.
         cutout_ratio: Aspect ratio range supplied to ``RandomErasing``.
-        random_resize_method: Whether to add an additional resize with random interpolation.
 
     Returns:
         Composed transform pipeline.
@@ -322,21 +322,35 @@ def create_train_transform(
         v2.ToDtype(torch.float32, scale=True),  # Scale to [0, 1] for alpha blending
         RgbaToRgbWithWhiteBackground(),  # Convert RGBA to RGB with white background
         PadToSquare([1.0, 1.0, 1.0]),  # Pad to square with white background
-        v2.RandomHorizontalFlip(p=0.5),
-        v2.RandomResizedCrop(
-            size=image_size,
-            scale=random_crop_scale,
-            interpolation=TorchvisionInterpolationMode.BILINEAR,
-            antialias=True,
-        ),
     ]
 
-    # Add random interpolation resize if enabled
-    if random_resize_method:
-        transform_steps.append(create_random_interpolation_resize(size=image_size))
+    if noise_level >= 1:
+        transform_steps.extend(
+            [
+                v2.RandomHorizontalFlip(p=0.5),
+                v2.RandomResizedCrop(
+                    size=image_size,
+                    scale=random_crop_scale,
+                    interpolation=TorchvisionInterpolationMode.BILINEAR,
+                    antialias=True,
+                ),
+            ],
+        )
 
-    # Add rotation if enabled
-    if rotation_degrees > 0:
+    transform_steps.append(create_random_interpolation_resize(size=image_size))
+
+    if noise_level >= 2:
+        # Add random erasing (cutout)
+        transform_steps.append(
+            v2.RandomErasing(
+                p=0.5,
+                scale=cutout_scale,
+                ratio=cutout_ratio,
+                value=0.5,  # Gray fill matching TensorFlow implementation
+            ),
+        )
+
+    if noise_level >= 1 and rotation_degrees > 0.0:
         transform_steps.append(
             v2.RandomRotation(
                 degrees=(-rotation_degrees, rotation_degrees),
@@ -344,16 +358,6 @@ def create_train_transform(
                 fill=1.0,  # White fill for boundary
             ),
         )
-
-    # Add random erasing (cutout)
-    transform_steps.append(
-        v2.RandomErasing(
-            p=0.5,
-            scale=cutout_scale,
-            ratio=cutout_ratio,
-            value=0.5,  # Gray fill matching TensorFlow implementation
-        ),
-    )
 
     # Convert to float and normalize
     transform_steps.extend(
@@ -411,21 +415,21 @@ class WDTaggerImageProcessor(BaseImageProcessor):
     def __init__(
         self,
         pretrained_model_name_or_path: str,
+        noise_level: int = 0,
         do_train_augmentations: bool = False,
         random_crop_scale: tuple[float, float] = (0.87, 0.998),
         rotation_degrees: float = 0.0,
         cutout_scale: tuple[float, float] = (0.02, 0.1),
         cutout_ratio: tuple[float, float] = (0.3, 3.3),
-        random_resize_method: bool = True,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
         self.pretrained_model_name_or_path = pretrained_model_name_or_path
+        self.noise_level = noise_level
         self.random_crop_scale = random_crop_scale
         self.rotation_degrees = rotation_degrees
         self.cutout_scale = cutout_scale
         self.cutout_ratio = cutout_ratio
-        self.random_resize_method = random_resize_method
         self.do_train_augmentations = do_train_augmentations
 
         image_size, mean, std = _load_image_processor_stats(pretrained_model_name_or_path)
@@ -447,11 +451,11 @@ class WDTaggerImageProcessor(BaseImageProcessor):
         if self._train_transform is None:
             self._train_transform = create_train_transform(
                 pretrained_model_name_or_path=self.pretrained_model_name_or_path,
+                noise_level=self.noise_level,
                 random_crop_scale=self.random_crop_scale,
                 rotation_degrees=self.rotation_degrees,
                 cutout_scale=self.cutout_scale,
                 cutout_ratio=self.cutout_ratio,
-                random_resize_method=self.random_resize_method,
             )
         return self._train_transform
 

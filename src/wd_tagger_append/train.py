@@ -1160,6 +1160,15 @@ def main(
         OptimizerNames,
         typer.Option("--optim", help="Optimizer to use (see transformers.optimizers)."),
     ] = OptimizerNames.ADAMW_TORCH,
+    noise_level: Annotated[
+        int,
+        typer.Option(
+            "--noise-level",
+            min=0,
+            max=2,
+            help="Noise level for data augmentation.",
+        ),
+    ] = 0,
     torch_compile: Annotated[
         bool,
         typer.Option(
@@ -1272,7 +1281,10 @@ def main(
     typer.echo(f"Final label space: {len(label_artifacts.label_list)} tags")
 
     typer.echo("Initializing image processor pipelines...")
-    image_processor = WDTaggerImageProcessor(pretrained_model_name_or_path=repo_id)
+    image_processor = WDTaggerImageProcessor(
+        pretrained_model_name_or_path=repo_id,
+        noise_level=noise_level,
+    )
 
     transform_planner = TransformPlanner(
         image_processor=image_processor,
