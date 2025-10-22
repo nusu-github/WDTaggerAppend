@@ -241,14 +241,8 @@ class LabelCatalogLoader:
         adapter_revision: str | None,
         adapter_token: str | None,
         fallback_repo: str | None = None,
+        forget_base_labels: bool = False,
     ) -> LabelCatalog:
-        base_catalog = self._load_base_catalog(
-            base_identifier,
-            revision=base_revision,
-            token=base_token,
-            fallback_repo=fallback_repo,
-        )
-
         locator = LabelArtifactLocator(self._hub_fetcher)
         csv_path = locator.locate(
             explicit_path=labels_path,
@@ -258,7 +252,19 @@ class LabelCatalogLoader:
         )
 
         if csv_path is None:
-            return base_catalog
+            if forget_base_labels:
+                msg = (
+                    "No label file found. Provide --labels-path or ensure the adapter contains "
+                    "selected_tags.csv when --forget-base-labels is enabled."
+                )
+                raise FileNotFoundError(msg)
+
+            return self._load_base_catalog(
+                base_identifier,
+                revision=base_revision,
+                token=base_token,
+                fallback_repo=fallback_repo,
+            )
 
         if self._warning_callback is not None:
             self._warning_callback(f"Loading labels from {csv_path}...")

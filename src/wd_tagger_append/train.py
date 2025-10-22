@@ -145,16 +145,24 @@ class LabelSpaceBuilder:
         selection: LabelSelection,
         output_dir: Path,
         report: Callable[[str], None],
+        *,
+        forget_base_labels: bool,
     ) -> None:
         self._selection = selection
         self._output_dir = output_dir
         self._report = report
+        self._forget_base_labels = forget_base_labels
 
     def build(self, base_label_data: LabelData, combined_dataset: Dataset) -> LabelArtifacts:
         all_categories = ("rating", "general", "character")
 
-        base_labels = list(base_label_data.names)
-        base_label_set = set(base_labels)
+        if self._forget_base_labels:
+            self._report("Base label retention disabled; using dataset tags only.")
+            base_labels: list[str] = []
+            base_label_set: set[str] = set()
+        else:
+            base_labels = list(base_label_data.names)
+            base_label_set = set(base_labels)
 
         tag_frequencies = count_tag_frequencies(combined_dataset, categories=all_categories)
         new_tags_frequencies = {
@@ -207,11 +215,14 @@ class LabelSpaceBuilder:
             f"{len(filtered_new_tags)} new tags = {len(label_list)} total",
         )
 
-        base_label_indices = {
-            "rating": {base_labels[idx] for idx in base_label_data.rating},
-            "character": {base_labels[idx] for idx in base_label_data.character},
-            "general": {base_labels[idx] for idx in base_label_data.general},
-        }
+        if self._forget_base_labels:
+            base_label_indices = {"rating": set(), "character": set(), "general": set()}
+        else:
+            base_label_indices = {
+                "rating": {base_labels[idx] for idx in base_label_data.rating},
+                "character": {base_labels[idx] for idx in base_label_data.character},
+                "general": {base_labels[idx] for idx in base_label_data.general},
+            }
 
         tag_categories = categorize_label_list(
             label_list=label_list,
@@ -411,20 +422,23 @@ class ModelPreparer:
         if self._freeze_base_labels:
             num_base_labels = len(label_artifacts.base_labels)
             num_new_labels = len(label_artifacts.label_list) - num_base_labels
-            self._report(
-                f"Freezing {num_base_labels} base labels; training only {num_new_labels} new labels",
-            )
+            if num_base_labels == 0:
+                self._report("No base labels detected; skipping gradient masking.")
+            else:
+                self._report(
+                    f"Freezing {num_base_labels} base labels; training only {num_new_labels} new labels",
+                )
 
-            classifier, _ = _resolve_peft_module(model)
+                classifier, _ = _resolve_peft_module(model)
 
-            weight_hook = _create_gradient_mask_hook(num_base_labels)
-            classifier.weight.register_hook(weight_hook)
+                weight_hook = _create_gradient_mask_hook(num_base_labels)
+                classifier.weight.register_hook(weight_hook)
 
-            if classifier.bias is not None:
-                bias_hook = _create_gradient_mask_hook(num_base_labels)
-                classifier.bias.register_hook(bias_hook)
+                if classifier.bias is not None:
+                    bias_hook = _create_gradient_mask_hook(num_base_labels)
+                    classifier.bias.register_hook(bias_hook)
 
-            self._report("Gradient masking hooks registered for base model labels")
+                self._report("Gradient masking hooks registered for base model labels")
 
         return ModelPreparationResult(
             model=model,
@@ -824,6 +838,13 @@ def main(
             resolve_path=True,
         ),
     ] = None,
+    forget_base_labels: Annotated[
+        bool,
+        typer.Option(
+            "--forget-base-labels/--keep-base-labels",
+            help="Exclude base model labels when building the training label space.",
+        ),
+    ] = False,
     train_split: Annotated[
         str,
         typer.Option("--train-split", help="Split name used for training."),
@@ -1175,7 +1196,15 @@ def main(
 
     combined = DatasetManager.combine(splits)
 
-    base_label_data = load_labels_hf(repo_id=repo_id, revision=base_revision, token=hub_token)
+    if forget_base_labels:
+        typer.echo("Forgetting base labels; classifier head will use dataset tags only.")
+        base_label_data = LabelData(names=[], rating=[], general=[], character=[])
+    else:
+        base_label_data = load_labels_hf(
+            repo_id=repo_id,
+            revision=base_revision,
+            token=hub_token,
+        )
 
     label_selection = LabelSelection(
         include_rating=rating,
@@ -1184,7 +1213,12 @@ def main(
         min_count=min_tag_count,
         allowed_tags_file=allowed_tags_file,
     )
-    label_builder = LabelSpaceBuilder(label_selection, output_dir, typer.echo)
+    label_builder = LabelSpaceBuilder(
+        label_selection,
+        output_dir,
+        typer.echo,
+        forget_base_labels=forget_base_labels,
+    )
     label_artifacts = label_builder.build(base_label_data, combined)
 
     typer.echo(

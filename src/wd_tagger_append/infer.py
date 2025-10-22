@@ -113,6 +113,7 @@ class LabelMetadataService:
         labels_path: Path | None,
         adapter_settings: AdapterSettings,
         fallback_repo: str | None,
+        forget_base_labels: bool,
     ) -> LabelData:
         catalog = self._loader.load(
             base_identifier,
@@ -123,6 +124,7 @@ class LabelMetadataService:
             adapter_revision=adapter_settings.revision,
             adapter_token=adapter_settings.token,
             fallback_repo=fallback_repo,
+            forget_base_labels=forget_base_labels,
         )
         return LabelData.from_catalog(catalog)
 
@@ -564,6 +566,13 @@ def main(
             resolve_path=True,
         ),
     ] = None,
+    forget_base_labels: Annotated[
+        bool,
+        typer.Option(
+            "--forget-base-labels/--keep-base-labels",
+            help="Skip base model label fallbacks and require explicit label artifacts.",
+        ),
+    ] = False,
     revision: Annotated[
         str | None,
         typer.Option("--revision", help="Revision or branch to use for the base model."),
@@ -719,22 +728,30 @@ def main(
             base_identifier = adapter_config.base_model_name_or_path
             typer.echo(f"Using '{base_identifier}' for inference.")
 
-    typer.echo("Loading label metadata...")
-
     def _emit_label_message(message: str) -> None:
         typer.echo(message, err=message.startswith("Warning:"))
 
     label_service = LabelMetadataService(warning_callback=_emit_label_message)
-    labels = label_service.load(
-        base_identifier,
-        base_revision=revision,
-        base_token=token,
-        labels_path=labels_path,
-        adapter_settings=adapter_settings,
-        fallback_repo=(
-            adapter_config.base_model_name_or_path if adapter_config is not None else None
-        ),
+    typer.echo(
+        "Skipping base model label fallbacks; relying on adapter or explicit labels."
+        if forget_base_labels
+        else "Loading label metadata...",
     )
+
+    try:
+        labels = label_service.load(
+            base_identifier,
+            base_revision=revision,
+            base_token=token,
+            labels_path=labels_path,
+            adapter_settings=adapter_settings,
+            fallback_repo=(
+                adapter_config.base_model_name_or_path if adapter_config is not None else None
+            ),
+            forget_base_labels=forget_base_labels,
+        )
+    except FileNotFoundError as exc:
+        _raise_bad_parameter(str(exc), cause=exc)
 
     runtime_options = RuntimeOptions(
         quantization=quantization,
