@@ -159,7 +159,7 @@ class ModelLoader:
         if quantization_config is not None:
             base_kwargs["quantization_config"] = quantization_config
         if precision_dtype is not None and quantization_config is None:
-            base_kwargs["torch_dtype"] = precision_dtype
+            base_kwargs["dtype"] = precision_dtype
         if self._options.device_map is not None:
             base_kwargs["device_map"] = self._options.device_map
         if token is not None:
